@@ -12,8 +12,8 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.firefox.service import Service
 
 console = Console()
 fake = Faker('en_US')
@@ -30,7 +30,7 @@ def generate_identity():
         "day": str(random.randint(1, 28)),
         "month": str(random.randint(1, 12)),
         "year": str(random.randint(1990, 2004)),
-        "gender": random.choice(["1", "2"]) # 1=Female, 2=Male
+        "gender": random.choice(["1", "2"]) 
     }
 
 def save_account(data):
@@ -39,11 +39,10 @@ def save_account(data):
 
 def main():
     console.clear()
-    console.print(Panel.fit("[bold cyan]FACEBOOK AUTO REGISTRATION[/]\n[dim]Selenium + Termux Fixed Version[/]", border_style="cyan"))
+    console.print(Panel.fit("[bold cyan]FACEBOOK AUTO REGISTRATION[/]\n[dim]Firefox + Termux Version[/]", border_style="cyan"))
 
     contact = Prompt.ask("\n[bold yellow]Enter Email or Phone Number[/]")
     
-    # বাংলাদেশি নাম্বার হলে 88 যোগ করার লজিক
     if "@" not in contact:
         contact = contact.replace(" ", "").replace("-", "")
         if contact.startswith("+88"):
@@ -63,57 +62,48 @@ def main():
     t.add_row("Password", identity['password'])
     console.print(t)
 
-    console.print("\n[bold yellow]▶ Launching Browser...[/]")
+    console.print("\n[bold yellow]▶ Launching Firefox Browser...[/]")
     
-    # ─── Termux-এর জন্য বিশেষ Selenium সেটিংস ───
+    # ─── Firefox Options ───
     options = Options()
-    options.binary_location = "/data/data/com.termux/files/usr/bin/chromium-browser"
+    options.add_argument("-headless") # হেডলেস মোড
+    options.set_preference("dom.webdriver.enabled", False)
+    options.set_preference("useAutomationExtension", False)
+    options.set_preference("general.useragent.override", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0")
     
-    # ক্র্যাশ বন্ধ করার জন্য জরুরি আর্গুমেন্টস
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--headless=new") 
-    options.add_argument("--disable-software-rasterizer")
-    options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--remote-debugging-port=9222")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    
-    # অটোমেশন ডিটেকশন বন্ধ করা
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
-
     if proxy:
         parts = proxy.split(":")
         if len(parts) == 4:
-            options.add_argument(f'--proxy-server=http://{parts[0]}:{parts[1]}')
+            options.set_preference("network.proxy.type", 1)
+            options.set_preference("network.proxy.http", parts[0])
+            options.set_preference("network.proxy.http_port", int(parts[1]))
+            options.set_preference("network.proxy.ssl", parts[0])
+            options.set_preference("network.proxy.ssl_port", int(parts[1]))
+            # Firefox-এ প্রোক্সি অথেনটিকেশন হ্যান্ডল করা একটু কঠিন, তবে সাধারণ ক্ষেত্রে কাজ করে
         elif len(parts) == 2:
-            options.add_argument(f'--proxy-server=http://{parts[0]}:{parts[1]}')
+            options.set_preference("network.proxy.type", 1)
+            options.set_preference("network.proxy.http", parts[0])
+            options.set_preference("network.proxy.http_port", int(parts[1]))
 
     driver = None
     try:
-        # ─── Termux-এর সঠিক chromedriver পাথ ───
-        service = Service(executable_path="/data/data/com.termux/files/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=options)
+        # Geckodriver সার্ভিস
+        service = Service(executable_path="/data/data/com.termux/files/usr/bin/geckodriver")
+        print("→ Starting GeckoDriver...")
+        driver = webdriver.Firefox(service=service, options=options)
         
-        # ওয়েবড্রাইভার হাইড করা
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        console.print("[dim]Loading Facebook Registration Page...[/]")
+        print("→ Firefox opened. Loading Facebook...")
         driver.get("https://www.facebook.com/reg/")
         
-        # ফর্ম লোড হওয়া পর্যন্ত অপেক্ষা
-        wait = WebDriverWait(driver, 25)
+        wait = WebDriverWait(driver, 30)
+        print("→ Waiting for form to load...")
         wait.until(EC.presence_of_element_located((By.NAME, "firstname")))
+        print("→ Form loaded! Filling...")
 
-        console.print("[dim]Filling form...[/]")
-        
         driver.find_element(By.NAME, "firstname").send_keys(identity["first_name"])
         driver.find_element(By.NAME, "lastname").send_keys(identity["last_name"])
         driver.find_element(By.NAME, "reg_email__").send_keys(contact)
         
-        # ইমেইল দিলে কনফার্মেশন বক্স ফিল করা
         if "@" in contact:
             try:
                 driver.find_element(By.NAME, "reg_email_confirmation__").send_keys(contact)
@@ -122,22 +112,19 @@ def main():
 
         driver.find_element(By.NAME, "reg_passwd__").send_keys(identity["password"])
         
-        # ড্রপডাউন
         Select(driver.find_element(By.ID, "day")).select_by_value(identity["day"])
         Select(driver.find_element(By.ID, "month")).select_by_value(identity["month"])
         Select(driver.find_element(By.ID, "year")).select_by_value(identity["year"])
         
-        # জেন্ডার
         driver.find_element(By.XPATH, f'//input[@name="sex" and @value="{identity["gender"]}"]').click()
         time.sleep(1)
         
-        console.print("[dim]Submitting form...[/]")
+        print("→ Submitting form...")
         driver.find_element(By.NAME, "websubmit").click()
         
-        console.print("[dim]Waiting for Facebook response...[/]")
+        print("→ Waiting for Facebook response (8s)...")
         time.sleep(8) 
 
-        # রেসপন্স চেক
         page_url = driver.current_url
         content = driver.page_source.lower()
         
@@ -175,6 +162,7 @@ def main():
             console.print("[bold red]❌ Facebook এই IP বা ডিভাইস ব্লক করেছে / CAPTCHA দিয়েছে। নতুন Proxy ব্যবহার করুন।[/]")
         else:
             console.print("[bold yellow]⚠ অজানা রেসপন্স। ফেসবুক হয়তো ফর্ম সাবমিট নেয়নি।[/]")
+            print(f"URL: {driver.current_url}")
 
     except Exception as e:
         console.print(f"\n[bold red]Error: {e}[/]")
