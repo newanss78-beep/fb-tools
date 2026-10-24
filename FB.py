@@ -14,12 +14,11 @@ console = Console()
 fake = Faker()
 ACCOUNTS_FILE = Path("accounts.txt")
 
-# ─── Termux Chromium Path ───
 def get_chromium_path():
     path = "/data/data/com.termux/files/usr/bin/chromium"
     if os.path.exists(path):
         return path
-    return None  # পিসিতে চালালে ডিফল্ট ব্রাউজার ব্যবহার করবে
+    return None
 
 def generate_identity():
     first = fake.first_name()
@@ -32,7 +31,7 @@ def generate_identity():
         "day": str(random.randint(1, 28)),
         "month": str(random.randint(1, 12)),
         "year": str(random.randint(1990, 2004)),
-        "gender": random.choice(["1", "2"]) # 1=Female, 2=Male
+        "gender": random.choice(["1", "2"])
     }
 
 def save_account(data):
@@ -43,7 +42,6 @@ def main():
     console.clear()
     console.print(Panel.fit("[bold cyan]FACEBOOK AUTO REGISTRATION[/]\n[dim]Playwright + Termux Version[/]", border_style="cyan"))
 
-    # ১. ইনপুট নেওয়া
     contact = Prompt.ask("\n[bold yellow]Enter Email or Phone Number[/]")
     proxy = Prompt.ask("[bold yellow]Enter Proxy (host:port:user:pass) or leave blank[/]", default="")
 
@@ -57,16 +55,14 @@ def main():
     t.add_row("Password", identity['password'])
     console.print(t)
 
-    # ২. ব্রাউজার ওপেন করা
     console.print("\n[bold yellow]▶ Launching Browser...[/]")
     
     with sync_playwright() as p:
         launch_args = {
-            "headless": True, # Termux-এ GUI ছাড়া চালানোর জন্য
+            "headless": True,
             "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
         }
         
-        # Termux হলে সিস্টেম Chromium ব্যবহার করবে
         chromium_path = get_chromium_path()
         if chromium_path:
             launch_args["executable_path"] = chromium_path
@@ -90,7 +86,6 @@ def main():
         )
         page = context.new_page()
 
-        # ৩. ফেসবুক রেজিস্ট্রেশন পেজে যাওয়া
         try:
             console.print("[dim]Loading Facebook...[/]")
             page.goto("https://www.facebook.com/reg/", timeout=60000)
@@ -100,11 +95,10 @@ def main():
             page.fill('input[name="firstname"]', identity["first_name"])
             page.fill('input[name="lastname"]', identity["last_name"])
             
-            # Email বা Phone ফিল্ড
             if "@" in contact:
                 page.fill('input[name="reg_email__"]', contact)
             else:
-                page.fill('input[name="reg_email__"]', contact) # FB মোবাইল নাম্বার একই বক্সে নেয়
+                page.fill('input[name="reg_email__"]', contact)
 
             page.fill('input[name="reg_passwd__"]', identity["password"])
             
@@ -115,12 +109,10 @@ def main():
             page.click(f'input[name="sex"][value="{identity["gender"]}"]')
             time.sleep(1)
             
-            # সাবমিট বাটন
             console.print("[dim]Submitting form...[/]")
             page.click('button[name="websubmit"]')
-            time.sleep(6) # ফেসবুক লোড হওয়ার জন্য অপেক্ষা
+            time.sleep(6)
 
-            # ৪. OTP চেক করা
             content = page.content().lower()
             
             if "checkpoint" in page.url or "code" in content or "confirm" in content:
@@ -130,7 +122,6 @@ def main():
                 if otp:
                     try:
                         console.print("[dim]Submitting OTP...[/]")
-                        # OTP ইনপুট ফিল্ড খোঁজা
                         page.fill('input[name="code"]', otp)
                         page.click('button[type="submit"]')
                         time.sleep(5)
