@@ -13,7 +13,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service # ⬅️ নতুন যোগ হয়েছে
+from selenium.webdriver.chrome.service import Service
 
 console = Console()
 fake = Faker('en_US')
@@ -30,7 +30,7 @@ def generate_identity():
         "day": str(random.randint(1, 28)),
         "month": str(random.randint(1, 12)),
         "year": str(random.randint(1990, 2004)),
-        "gender": random.choice(["1", "2"]) 
+        "gender": random.choice(["1", "2"]) # 1=Female, 2=Male
     }
 
 def save_account(data):
@@ -39,10 +39,11 @@ def save_account(data):
 
 def main():
     console.clear()
-    console.print(Panel.fit("[bold cyan]FACEBOOK AUTO REGISTRATION[/]\n[dim]Selenium + Termux Version[/]", border_style="cyan"))
+    console.print(Panel.fit("[bold cyan]FACEBOOK AUTO REGISTRATION[/]\n[dim]Selenium + Termux Fixed Version[/]", border_style="cyan"))
 
     contact = Prompt.ask("\n[bold yellow]Enter Email or Phone Number[/]")
     
+    # বাংলাদেশি নাম্বার হলে 88 যোগ করার লজিক
     if "@" not in contact:
         contact = contact.replace(" ", "").replace("-", "")
         if contact.startswith("+88"):
@@ -64,14 +65,22 @@ def main():
 
     console.print("\n[bold yellow]▶ Launching Browser...[/]")
     
+    # ─── Termux-এর জন্য বিশেষ Selenium সেটিংস ───
     options = Options()
     options.binary_location = "/data/data/com.termux/files/usr/bin/chromium-browser"
+    
+    # ক্র্যাশ বন্ধ করার জন্য জরুরি আর্গুমেন্টস
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--headless") 
+    options.add_argument("--headless=new") 
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
+    # অটোমেশন ডিটেকশন বন্ধ করা
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
 
@@ -82,17 +91,20 @@ def main():
         elif len(parts) == 2:
             options.add_argument(f'--proxy-server=http://{parts[0]}:{parts[1]}')
 
+    driver = None
     try:
-        # ⬇️ এখানে chromedriver-এর পাথ সেট করা হলো ⬇️
+        # ─── Termux-এর সঠিক chromedriver পাথ ───
         service = Service(executable_path="/data/data/com.termux/files/usr/bin/chromedriver")
         driver = webdriver.Chrome(service=service, options=options)
         
+        # ওয়েবড্রাইভার হাইড করা
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         console.print("[dim]Loading Facebook Registration Page...[/]")
         driver.get("https://www.facebook.com/reg/")
         
-        wait = WebDriverWait(driver, 20)
+        # ফর্ম লোড হওয়া পর্যন্ত অপেক্ষা
+        wait = WebDriverWait(driver, 25)
         wait.until(EC.presence_of_element_located((By.NAME, "firstname")))
 
         console.print("[dim]Filling form...[/]")
@@ -101,6 +113,7 @@ def main():
         driver.find_element(By.NAME, "lastname").send_keys(identity["last_name"])
         driver.find_element(By.NAME, "reg_email__").send_keys(contact)
         
+        # ইমেইল দিলে কনফার্মেশন বক্স ফিল করা
         if "@" in contact:
             try:
                 driver.find_element(By.NAME, "reg_email_confirmation__").send_keys(contact)
@@ -109,10 +122,12 @@ def main():
 
         driver.find_element(By.NAME, "reg_passwd__").send_keys(identity["password"])
         
+        # ড্রপডাউন
         Select(driver.find_element(By.ID, "day")).select_by_value(identity["day"])
         Select(driver.find_element(By.ID, "month")).select_by_value(identity["month"])
         Select(driver.find_element(By.ID, "year")).select_by_value(identity["year"])
         
+        # জেন্ডার
         driver.find_element(By.XPATH, f'//input[@name="sex" and @value="{identity["gender"]}"]').click()
         time.sleep(1)
         
@@ -122,6 +137,7 @@ def main():
         console.print("[dim]Waiting for Facebook response...[/]")
         time.sleep(8) 
 
+        # রেসপন্স চেক
         page_url = driver.current_url
         content = driver.page_source.lower()
         
@@ -163,10 +179,11 @@ def main():
     except Exception as e:
         console.print(f"\n[bold red]Error: {e}[/]")
     finally:
-        try:
-            driver.quit()
-        except:
-            pass
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
 
     Prompt.ask("\n[dim]Press Enter to exit...[/]", default="")
 
