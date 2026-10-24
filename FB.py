@@ -13,6 +13,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service # ⬅️ নতুন যোগ হয়েছে
 
 console = Console()
 fake = Faker('en_US')
@@ -29,7 +30,7 @@ def generate_identity():
         "day": str(random.randint(1, 28)),
         "month": str(random.randint(1, 12)),
         "year": str(random.randint(1990, 2004)),
-        "gender": random.choice(["1", "2"]) # 1=Female, 2=Male
+        "gender": random.choice(["1", "2"]) 
     }
 
 def save_account(data):
@@ -42,7 +43,6 @@ def main():
 
     contact = Prompt.ask("\n[bold yellow]Enter Email or Phone Number[/]")
     
-    # ফোন নাম্বার ঠিক করার লজিক
     if "@" not in contact:
         contact = contact.replace(" ", "").replace("-", "")
         if contact.startswith("+88"):
@@ -64,16 +64,14 @@ def main():
 
     console.print("\n[bold yellow]▶ Launching Browser...[/]")
     
-    # Selenium Chrome Options
     options = Options()
     options.binary_location = "/data/data/com.termux/files/usr/bin/chromium-browser"
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--headless") # Termux এ ছাড়া স্ক্রিন নেই, তাই headless
+    options.add_argument("--headless") 
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    # অটোমেশন ডিটেকশন বন্ধ করা
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
 
@@ -85,14 +83,15 @@ def main():
             options.add_argument(f'--proxy-server=http://{parts[0]}:{parts[1]}')
 
     try:
-        # Termux এ chromedriver ডিফল্ট পাথে থাকে
-        driver = webdriver.Chrome(options=options)
+        # ⬇️ এখানে chromedriver-এর পাথ সেট করা হলো ⬇️
+        service = Service(executable_path="/data/data/com.termux/files/usr/bin/chromedriver")
+        driver = webdriver.Chrome(service=service, options=options)
+        
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         console.print("[dim]Loading Facebook Registration Page...[/]")
         driver.get("https://www.facebook.com/reg/")
         
-        # ফর্ম লোড হওয়া পর্যন্ত অপেক্ষা
         wait = WebDriverWait(driver, 20)
         wait.until(EC.presence_of_element_located((By.NAME, "firstname")))
 
@@ -110,12 +109,10 @@ def main():
 
         driver.find_element(By.NAME, "reg_passwd__").send_keys(identity["password"])
         
-        # ড্রপডাউন সিলেক্ট
         Select(driver.find_element(By.ID, "day")).select_by_value(identity["day"])
         Select(driver.find_element(By.ID, "month")).select_by_value(identity["month"])
         Select(driver.find_element(By.ID, "year")).select_by_value(identity["year"])
         
-        # জেন্ডার রেডিও বাটন
         driver.find_element(By.XPATH, f'//input[@name="sex" and @value="{identity["gender"]}"]').click()
         time.sleep(1)
         
@@ -125,7 +122,6 @@ def main():
         console.print("[dim]Waiting for Facebook response...[/]")
         time.sleep(8) 
 
-        # রেসপন্স চেক
         page_url = driver.current_url
         content = driver.page_source.lower()
         
