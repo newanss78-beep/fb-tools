@@ -66,7 +66,7 @@ def main():
     
     # ─── Firefox Options ───
     options = Options()
-    options.add_argument("-headless") # হেডলেস মোড
+    options.add_argument("-headless")
     options.set_preference("dom.webdriver.enabled", False)
     options.set_preference("useAutomationExtension", False)
     options.set_preference("general.useragent.override", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0")
@@ -79,7 +79,6 @@ def main():
             options.set_preference("network.proxy.http_port", int(parts[1]))
             options.set_preference("network.proxy.ssl", parts[0])
             options.set_preference("network.proxy.ssl_port", int(parts[1]))
-            # Firefox-এ প্রোক্সি অথেনটিকেশন হ্যান্ডল করা একটু কঠিন, তবে সাধারণ ক্ষেত্রে কাজ করে
         elif len(parts) == 2:
             options.set_preference("network.proxy.type", 1)
             options.set_preference("network.proxy.http", parts[0])
@@ -87,7 +86,6 @@ def main():
 
     driver = None
     try:
-        # Geckodriver সার্ভিস
         service = Service(executable_path="/data/data/com.termux/files/usr/bin/geckodriver")
         print("→ Starting GeckoDriver...")
         driver = webdriver.Firefox(service=service, options=options)
@@ -95,18 +93,24 @@ def main():
         print("→ Firefox opened. Loading Facebook...")
         driver.get("https://www.facebook.com/reg/")
         
-        wait = WebDriverWait(driver, 30)
-        print("→ Waiting for form to load...")
-        wait.until(EC.presence_of_element_located((By.NAME, "firstname")))
+        # ─── সঠিক সমাধান: ফর্ম লোড হওয়ার জন্য অপেক্ষা করা ───
+        wait = WebDriverWait(driver, 30) # সর্বোচ্চ ৩০ সেকেন্ড অপেক্ষা করবে
+        print("→ Waiting for form to load (This may take a moment)...")
+        
+        # firstname ফিল্ডটি ক্লিকযোগ্য (clickable) হওয়া পর্যন্ত অপেক্ষা করবে
+        firstname_field = wait.until(EC.element_to_be_clickable((By.NAME, "firstname")))
         print("→ Form loaded! Filling...")
 
-        driver.find_element(By.NAME, "firstname").send_keys(identity["first_name"])
+        # ─── ফর্ম ফিল করা ───
+        firstname_field.send_keys(identity["first_name"])
         driver.find_element(By.NAME, "lastname").send_keys(identity["last_name"])
         driver.find_element(By.NAME, "reg_email__").send_keys(contact)
         
         if "@" in contact:
             try:
-                driver.find_element(By.NAME, "reg_email_confirmation__").send_keys(contact)
+                # ইমেইল কনফার্মেশন বক্সটিও লোড হতে সময় নিতে পারে
+                email_confirm = wait.until(EC.presence_of_element_located((By.NAME, "reg_email_confirmation__")))
+                email_confirm.send_keys(contact)
             except:
                 pass
 
@@ -159,9 +163,9 @@ def main():
             save_account(identity)
         
         elif "disabled" in content or "blocked" in content or "captcha" in content:
-            console.print("[bold red]❌ Facebook এই IP বা ডিভাইস ব্লক করেছে / CAPTCHA দিয়েছে। নতুন Proxy ব্যবহার করুন।[/]")
+            console.print("[bold red]❌ Facebook এই IP বা ডিভাইস ব্লক করেছে / CAPTCHA দিয়েছে। নতুন Proxy ব্যবহার করুন।[/]")
         else:
-            console.print("[bold yellow]⚠ অজানা রেসপন্স। ফেসবুক হয়তো ফর্ম সাবমিট নেয়নি।[/]")
+            console.print("[bold yellow]⚠ অজানা রেসপন্স। ফেসবুক হয়তো ফর্ম সাবমিট নেয়নি।[/]")
             print(f"URL: {driver.current_url}")
 
     except Exception as e:
