@@ -411,20 +411,18 @@ $("#csv").onclick=()=>{if(currentJob)window.location.href=`/api/export/${current
 # ═══════════════════════════════════════════════════════════
 def main():
     ap = argparse.ArgumentParser(description="Gmail IMAP Login Checker")
-    ap.add_argument("input", nargs="?", help="Input file (or '-' for stdin)")
+    ap.add_argument("input", nargs="?", help="Input file ('-' for stdin)")
     ap.add_argument("-o", "--output", help="CSV output file")
-    ap.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
-                    help=f"Concurrent workers (default {DEFAULT_WORKERS}, max {MAX_WORKERS})")
+    ap.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS)
     ap.add_argument("--web", action="store_true", help="Start Web UI")
-    ap.add_argument("-p", "--port", type=int, default=5000, help="Web UI port")
+    ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("PORT", 5000)))
     args = ap.parse_args()
-    if args.web:
-        try:
-            import flask  # noqa
-        except ImportError:
-            print("❌ Flask not installed. Run: pip install flask", file=sys.stderr)
-            return 1
-        return web_main(args)
+
+    # Railway / gunicorn এর বাইরে — PORT env থাকলে বা --web দিলে web mode
+    if args.web or (os.environ.get("PORT") and not args.input):
+        print(f"🌐 Web UI: http://0.0.0.0:{args.port}")
+        app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)
+        return 0
     return cli_main(args)
 
 
