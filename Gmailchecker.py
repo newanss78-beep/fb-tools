@@ -1,34 +1,44 @@
 #!/usr/bin/env python3
 """
-Gmail IMAP Login Checker — Standalone System
-=============================================
-Real Gmail IMAP login verification for `mail|app_password`.
+Gmail IMAP Login Checker — Web + CLI
+=====================================
+Railway-ready (Web UI DEFAULT).
 
-Run:
-    # CLI mode
-    python gmail_check.py accounts.txt
-    python gmail_check.py accounts.txt -o results.csv -w 5
+Local test:
+    python Gmailchecker.py --web              # http://localhost:5000
+    python Gmailchecker.py accounts.txt       # CLI mode
+    PORT=8080 python Gmailchecker.py          # env PORT দিয়ে web mode
 
-    # Web UI mode
-    python gmail_check.py --web
-    python gmail_check.py --web --port 8080 --workers 8
+Railway:
+    Start Command: python Gmailchecker.py --web
 """
-import imaplib, re, sys, csv, io, time, uuid, threading, argparse
+import imaplib, re, sys, csv, io, os, time, uuid, threading, argparse, functools
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from flask import Flask, request, jsonify, Response
+
+# ═══════════════════════════════════════════════════════════
+# CONFIG
 # ═══════════════════════════════════════════════════════════
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT = 15
-DEFAULT_WORKERS = 5
+DEFAULT_WORKERS = int(os.environ.get("WORKERS", "5"))
 MAX_WORKERS = 20
+MAX_ACCOUNTS_PER_JOB = 500
+JOB_TTL = 1800                 # 30 min
+RATE_WINDOW = 60               # seconds
+RATE_MAX = 10                  # requests per IP per window
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
 
 
 # ═══════════════════════════════════════════════════════════
+# INPUT PARSING
+# ═══════════════════════════════════════════════════════════
 def parse_line(line):
-    """`email|app password` → (email, password) or None."""
+    """`email|app_password` (বা tab/semicolon/colon) → (email, password) | None"""
     line = (line or "").strip().lstrip("\ufeff")
     if not line or line.startswith("#"):
         return None
@@ -49,7 +59,10 @@ def parse_line(line):
 
 
 # ═══════════════════════════════════════════════════════════
+# CORE IMAP CHECK
+# ═══════════════════════════════════════════════════════════
 def check_gmail(email, password):
+    """Real Gmail IMAP login. Returns dict with status + message."""
     pw_clean = re.sub(r"\s+", "", password)
     M = None
     try:
@@ -82,11 +95,9 @@ def check_gmail(email, password):
             pass
 
 
-# ═══════════════════════════════════════════════════════════
 def run_batch(accounts, workers=DEFAULT_WORKERS, on_progress=None):
-    """Check all (email, password) pairs. Returns results in original order."""
-    seen = {}
-    indexed = []
+    """Check all (email, password) pairs in parallel. Returns ordered results."""
+    seen, indexed = {}, []
     for i, (em, pw) in enumerate(accounts):
         key = (em.lower(), pw)
         if key in seen:
@@ -96,7 +107,6 @@ def run_batch(accounts, workers=DEFAULT_WORKERS, on_progress=None):
             indexed.append((i, em, pw, None))
 
     results = [None] * len(accounts)
-    total = len(accounts)
     done_count = [0]
     lock = threading.Lock()
 
@@ -111,89 +121,63 @@ def run_batch(accounts, workers=DEFAULT_WORKERS, on_progress=None):
             done_count[0] += 1
             if on_progress:
                 try:
-                    on_progress(done_count[0], total, res)
+                    on_progress(done_count[0], len(accounts), res)
                 except Exception:
                     pass
 
     workers = max(1, min(int(workers), MAX_WORKERS))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_do, idx, em, pw, dup_of)
-                   for idx, em, pw, dup_of in indexed]
+        futures = [pool.submit(_do, idx, em, pw, dup)
+                   for idx, em, pw, dup in indexed]
         for _ in as_completed(futures):
             pass
     return results
 
 
 # ═══════════════════════════════════════════════════════════
-# CLI MODE
+# FLASK APP (module-level → Railway/gunicorn friendly)
 # ═══════════════════════════════════════════════════════════
-COLOR = {"OK": "\033[92m", "FAILED": "\033[91m", "DUPLICATE": "\033[93m",
-         "IMAP_DISABLED": "\033[95m", "BLOCKED": "\033[91m", "NETWORK_ERROR": "\033[96m"}
-RESET = "\033[0m"
+app = Flask(__name__)
 
-
-def cli_main(args):
-    if args.input == "-" or not args.input:
-        print("Reading from stdin (Ctrl+D to finish)...")
-        raw = sys.stdin.read()
-        source_name = "stdin"
-    else:
-        p = Path(args.input)
-        if not p.exists():
-            print(f"❌ File not found: {args.input}", file=sys.stderr)
-            return 1
-        raw = p.read_text(encoding="utf-8", errors="ignore")
-        source_name = p.name
-
-    accounts = [parse_line(ln) for ln in raw.splitlines()]
-    accounts = [a for a in accounts if a]
-
-    if not accounts:
-        print("❌ No valid accounts found.", file=sys.stderr)
-        return 1
-
-    print(f"📄 {source_name} → {len(accounts)} accounts loaded")
-    print(f"⚙️  Checking with {args.workers} workers...\n")
-
-    def _progress(done, total, res):
-        sys.stdout.write(f"\r  [{done}/{total}] checking...")
-        sys.stdout.flush()
-
-    results = run_batch(accounts, workers=args.workers, on_progress=_progress)
-    print("\n")
-
-    print(f"{'#':<4} {'EMAIL':<35} {'STATUS':<16} MESSAGE")
-    print("─" * 100)
-    for r in results:
-        color = COLOR.get(r["status"], "")
-        print(f"{r['index']+1:<4} {r['email']:<35} {color}{r['status']:<16}{RESET} {r['message']}")
-    print("─" * 100)
-
-    counts = {}
-    for r in results:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-    print("\n📊 SUMMARY")
-    for k, v in sorted(counts.items(), key=lambda x: -x[1]):
-        color = COLOR.get(k, "")
-        print(f"   {color}{k:<16}{RESET} {v}")
-
-    if args.output:
-        out = Path(args.output)
-        with out.open("w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(["line", "email", "password", "status", "message"])
-            for r in results:
-                w.writerow([r["index"] + 1, r["email"], r["password"], r["status"], r["message"]])
-        print(f"\n💾 Saved to {out}")
-    return 0
-
-
-# ═══════════════════════════════════════════════════════════
-# WEB MODE
-# ═══════════════════════════════════════════════════════════
 _jobs = {}
 _jobs_lock = threading.Lock()
-JOB_TTL = 1800
+_ip_hits = defaultdict(deque)
+_ip_lock = threading.Lock()
+
+
+def _check_rate(ip):
+    now = time.time()
+    with _ip_lock:
+        dq = _ip_hits[ip]
+        while dq and dq[0] < now - RATE_WINDOW:
+            dq.popleft()
+        if len(dq) >= RATE_MAX:
+            return False
+        dq.append(now)
+        return True
+
+
+def _require_auth(f):
+    """Optional Basic Auth via env AUTH_USER / AUTH_PASS. না থাকলে auth বন্ধ।"""
+    @functools.wraps(f)
+    def wrapper(*a, **kw):
+        want_u = os.environ.get("AUTH_USER", "").strip()
+        want_p = os.environ.get("AUTH_PASS", "").strip()
+        if not want_u or not want_p:
+            return f(*a, **kw)
+        auth = request.authorization
+        if not auth or auth.username != want_u or auth.password != want_p:
+            return Response("Authentication required", 401,
+                            {"WWW-Authenticate": 'Basic realm="Gmail Checker"'})
+        return f(*a, **kw)
+    return wrapper
+
+
+def _cleanup_jobs():
+    now = time.time()
+    with _jobs_lock:
+        for j in [k for k, v in list(_jobs.items()) if now - v["started"] > JOB_TTL]:
+            _jobs.pop(j, None)
 
 
 def _create_job(accounts, workers):
@@ -202,88 +186,89 @@ def _create_job(accounts, workers):
         _jobs[jid] = {"id": jid, "total": len(accounts), "done": 0,
                       "results": [None] * len(accounts),
                       "started": time.time(), "finished": False}
+
     def _worker():
         job = _jobs[jid]
-        def _on_progress(done, total, res):
+
+        def _on(done, total, res):
             job["done"] = done
             job["results"][res["index"]] = {
                 "line": res["index"] + 1, "email": res["email"],
                 "status": res["status"], "message": res["message"],
             }
+
         try:
-            run_batch(accounts, workers=workers, on_progress=_on_progress)
+            run_batch(accounts, workers=workers, on_progress=_on)
         finally:
             job["finished"] = True
+
     threading.Thread(target=_worker, daemon=True).start()
     return jid
 
 
-def _cleanup_jobs():
-    now = time.time()
+@app.route("/health")
+def health():
+    return {"status": "ok", "service": "gmail-checker"}, 200
+
+
+@app.route("/")
+@_require_auth
+def index():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.route("/api/check", methods=["POST"])
+@_require_auth
+def api_check():
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
+    if not _check_rate(ip):
+        return jsonify({"ok": False, "error": "অনেকবার অনুরোধ — ১ মিনিট পর আবার চেষ্টা করুন"}), 429
+    _cleanup_jobs()
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    workers = int(data.get("workers") or DEFAULT_WORKERS)
+    if not text:
+        return jsonify({"ok": False, "error": "কোনো ডেটা নেই"})
+    accounts = [a for a in (parse_line(l) for l in text.splitlines()) if a]
+    if not accounts:
+        return jsonify({"ok": False, "error": "কোনো সঠিক mail|password লাইন পাওয়া যায়নি"})
+    if len(accounts) > MAX_ACCOUNTS_PER_JOB:
+        return jsonify({"ok": False, "error": f"প্রতি ব্যাচে সর্বোচ্চ {MAX_ACCOUNTS_PER_JOB}টি"})
+    jid = _create_job(accounts, workers)
+    return jsonify({"ok": True, "job_id": jid, "total": len(accounts)})
+
+
+@app.route("/api/status/<jid>")
+@_require_auth
+def api_status(jid):
     with _jobs_lock:
-        stale = [j for j, d in list(_jobs.items()) if now - d["started"] > JOB_TTL]
-        for j in stale:
-            _jobs.pop(j, None)
+        job = _jobs.get(jid)
+        if not job:
+            return jsonify({"ok": False, "error": "Job not found"}), 404
+        return jsonify({"ok": True, "total": job["total"], "done": job["done"],
+                        "finished": job["finished"],
+                        "results": [r for r in job["results"] if r is not None]})
 
 
-def web_main(args):
-    from flask import Flask, request, jsonify, Response
-    app = Flask(__name__)
-
-    @app.route("/")
-    def index():
-        return Response(INDEX_HTML, mimetype="text/html")
-
-    @app.route("/api/check", methods=["POST"])
-    def api_check():
-        _cleanup_jobs()
-        data = request.get_json(silent=True) or {}
-        text = (data.get("text") or "").strip()
-        workers = int(data.get("workers") or args.workers)
-        if not text:
-            return jsonify({"ok": False, "error": "কোনো ডেটা নেই"})
-        accounts = [parse_line(ln) for ln in text.splitlines()]
-        accounts = [a for a in accounts if a]
-        if not accounts:
-            return jsonify({"ok": False, "error": "কোনো সঠিক mail|password লাইন পাওয়া যায়নি"})
-        if len(accounts) > 500:
-            return jsonify({"ok": False, "error": "প্রতি ব্যাচে সর্বোচ্চ ৫০০টি"})
-        jid = _create_job(accounts, workers)
-        return jsonify({"ok": True, "job_id": jid, "total": len(accounts)})
-
-    @app.route("/api/status/<jid>")
-    def api_status(jid):
-        with _jobs_lock:
-            job = _jobs.get(jid)
-            if not job:
-                return jsonify({"ok": False, "error": "Job not found"}), 404
-            payload = {"ok": True, "total": job["total"], "done": job["done"],
-                       "finished": job["finished"],
-                       "results": [r for r in job["results"] if r is not None]}
-        return jsonify(payload)
-
-    @app.route("/api/export/<jid>")
-    def api_export(jid):
-        with _jobs_lock:
-            job = _jobs.get(jid)
-            if not job:
-                return "Job not found", 404
-            buf = io.StringIO()
-            w = csv.writer(buf)
-            w.writerow(["line", "email", "status", "message"])
-            for r in job["results"]:
-                if r:
-                    w.writerow([r["line"], r["email"], r["status"], r["message"]])
-        body = "\ufeff" + buf.getvalue()
-        return Response(body, mimetype="text/csv",
-                        headers={"Content-Disposition": f"attachment; filename=gmail_check_{jid[:8]}.csv"})
-
-    print(f"\n🌐 Web UI running at http://127.0.0.1:{args.port}")
-    print(f"   Workers: {args.workers}")
-    print("   Press Ctrl+C to stop.\n")
-    app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)
+@app.route("/api/export/<jid>")
+@_require_auth
+def api_export(jid):
+    with _jobs_lock:
+        job = _jobs.get(jid)
+        if not job:
+            return "Job not found", 404
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["line", "email", "status", "message"])
+        for r in job["results"]:
+            if r:
+                w.writerow([r["line"], r["email"], r["status"], r["message"]])
+    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename=gmail_check_{jid[:8]}.csv"})
 
 
+# ═══════════════════════════════════════════════════════════
+# WEB UI (embedded HTML)
 # ═══════════════════════════════════════════════════════════
 INDEX_HTML = r"""<!doctype html>
 <html lang="bn"><head><meta charset="utf-8">
@@ -334,6 +319,7 @@ th{background:#f8fafc;font-size:11px;text-transform:uppercase;letter-spacing:.5p
 .b-BLOCKED{background:#fee2e2;color:#991b1b}
 .b-NETWORK_ERROR{background:#cffafe;color:#155e75}
 .tblwrap{max-height:520px;overflow:auto;border:1px solid #e2e8f0;border-radius:12px;margin-top:12px}
+.foot{text-align:center;color:#94a3b8;font-size:12px;margin-top:20px}
 </style></head><body><div class="wrap">
 <h1>📧 Gmail IMAP Checker</h1>
 <div class="sub">Real IMAP login check — <code>mail|app_password</code> পেস্ট বা আপলোড করুন</div>
@@ -356,7 +342,9 @@ user2@gmail.com|password123"></textarea>
 </div>
 <div class="tblwrap"><table>
 <thead><tr><th style="width:60px">Line</th><th>Email</th><th style="width:160px">Status</th><th>Message</th></tr></thead>
-<tbody id="tbody"></tbody></table></div></div></div>
+<tbody id="tbody"></tbody></table></div></div>
+<div class="foot">Hosted on Railway · Gmail IMAP</div>
+</div>
 <script>
 const $=s=>document.querySelector(s);let currentJob=null,pollTimer=null;
 $("#file").onchange=async e=>{const f=e.target.files[0];if(!f)return;
@@ -409,22 +397,69 @@ $("#csv").onclick=()=>{if(currentJob)window.location.href=`/api/export/${current
 
 
 # ═══════════════════════════════════════════════════════════
+# CLI MODE
+# ═══════════════════════════════════════════════════════════
+COLOR = {"OK": "\033[92m", "FAILED": "\033[91m", "DUPLICATE": "\033[93m",
+         "IMAP_DISABLED": "\033[95m", "BLOCKED": "\033[91m", "NETWORK_ERROR": "\033[96m"}
+RESET = "\033[0m"
+
+
+def cli_main(args):
+    if args.input == "-" or not args.input:
+        print("Reading from stdin (Ctrl+D to finish)...")
+        raw = sys.stdin.read()
+        source_name = "stdin"
+    else:
+        p = Path(args.input)
+        if not p.exists():
+            print(f"❌ File not found: {args.input}", file=sys.stderr)
+            return 1
+        raw = p.read_text(encoding="utf-8", errors="ignore")
+        source_name = p.name
+
+    accounts = [a for a in (parse_line(l) for l in raw.splitlines()) if a]
+    if not accounts:
+        print("❌ No valid accounts found.", file=sys.stderr)
+        return 1
+
+    print(f"📄 {source_name} → {len(accounts)} accounts loaded")
+    print(f"⚙️  Checking with {args.workers} workers...\n")
+
+    def _progress(done, total, _):
+        sys.stdout.write(f"\r  [{done}/{total}] checking...")
+        sys.stdout.flush()
+
+    results = run_batch(accounts, workers=args.workers, on_progress=_progress)
+    print("\n")
+    print(f"{'#':<4} {'EMAIL':<35} {'STATUS':<16} MESSAGE")
+    print("─" * 100)
+    for r in results:
+        c = COLOR.get(r["status"], "")
+        print(f"{r['index']+1:<4} {r['email']:<35} {c}{r['status']:<16}{RESET} {r['message']}")
+    print("─" * 100)
+    counts = {}
+    for r in results:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    print("\n📊 SUMMARY")
+    for k, v in sorted(counts.items(), key=lambda x: -x[1]):
+        print(f"   {COLOR.get(k,'')}{k:<16}{RESET} {v}")
+    if args.output:
+        with Path(args.output).open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["line", "email", "password", "status", "message"])
+            for r in results:
+                w.writerow([r["index"] + 1, r["email"], r["password"], r["status"], r["message"]])
+        print(f"\n💾 Saved to {args.output}")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════
+# ENTRY POINT — WEB MODE IS DEFAULT
+# ═══════════════════════════════════════════════════════════
 def main():
     ap = argparse.ArgumentParser(description="Gmail IMAP Login Checker")
     ap.add_argument("input", nargs="?", help="Input file ('-' for stdin)")
     ap.add_argument("-o", "--output", help="CSV output file")
     ap.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS)
-    ap.add_argument("--web", action="store_true", help="Start Web UI")
-    ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("PORT", 5000)))
-    args = ap.parse_args()
-
-    # Railway / gunicorn এর বাইরে — PORT env থাকলে বা --web দিলে web mode
-    if args.web or (os.environ.get("PORT") and not args.input):
-        print(f"🌐 Web UI: http://0.0.0.0:{args.port}")
-        app.run(host="0.0.0.0", port=args.port, debug=False, threaded=True)
-        return 0
-    return cli_main(args)
-
-
-if __name__ == "__main__":
-    sys.exit(main() or 0)
+    ap.add_argument("--web", action="store_true", help="Start Web UI (default on Railway)")
+    ap.add_argument("-p", "--port", type=int, defaul
