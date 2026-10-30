@@ -462,4 +462,21 @@ def main():
     ap.add_argument("-o", "--output", help="CSV output file")
     ap.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS)
     ap.add_argument("--web", action="store_true", help="Start Web UI (default on Railway)")
-    ap.add_argument("-p", "--port", type=int, defaul
+    ap.add_argument("-p", "--port", type=int, default=5000)
+    args = ap.parse_args()
+
+    # CLI mode শুধু যখন input ফাইল দেওয়া হয়েছে আর --web দেওয়া হয়নি
+    if args.input and not args.web:
+        return cli_main(args)
+
+    # অন্যথায় সর্বদা Web mode (Railway-এ PORT env না থাকলেও 8080 fallback)
+    port = int(os.environ.get("PORT") or args.port or 8080)
+    print(f"🌐 Web UI running on http://0.0.0.0:{port}", flush=True)
+    print(f"   AUTH_USER = {os.environ.get('AUTH_USER') or '(off — public access!)'}", flush=True)
+    print(f"   WORKERS   = {os.environ.get('WORKERS', DEFAULT_WORKERS)}", flush=True)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
