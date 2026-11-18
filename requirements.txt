@@ -6,4 +6,4 @@ pytz
 requests
 pymysql
 cryptography
-gunicorn
+waitress
