@@ -210,6 +210,7 @@ KB_BUTTON_ROLES = {
     "proxy_p10":     ("⚪ Proxy Provider 10",           "primary"),
     "proxy_gb":     ("📦 GB Proxy",                   "primary"),
     "proxy_isp":    ("🌐 ISP Proxy",                  "primary"),
+    "proxy_cdkey":  ("🔑 All Proxy CD key",           "primary"),
     "dollar_buy_sell": ("💵 Dollar($) Buy/Sell",       "primary"),
     "gmail_sell":   ("📧 Gmail Sell",                 "primary"),
     "dollar_sell":  ("💰 Sell Dollar",                "primary"),
@@ -8844,6 +8845,7 @@ def _gic_svc_fields(sv):
     return (str(code) if code is not None else None), str(name), price
 
 
+_gic_stock_cache = {}     # {service_code: স্টক সংখ্যা} — সার্ভিস লিস্ট থেকে (ডিটেইলে "Available: N pcs" এর fallback)
 _gic_oos = set()           # স্টক-শেষ সার্ভিসের code (সার্ভিস লিস্ট রেসপন্স থেকে) — বাটন 🔴 লাল দেখানোর জন্য
 
 
@@ -8852,6 +8854,8 @@ def _gic_track_stock(sv, code):
     স্টকের তথ্য না থাকলে কিছুই বদলায় না (বাটন নীলই থাকে)।"""
     try:
         stock = _gic_first_num(sv, _GIC_STOCK_KEYS)
+        if stock is not None:
+            _gic_stock_cache[code] = stock
         out = None
         if sv.get("in_stock") is False or sv.get("available") is False or sv.get("is_available") is False:
             out = True
@@ -8888,7 +8892,8 @@ def _gic_detail_name(det, code):
 
 
 _GIC_PRICE_KEYS = ("price", "min_price", "price_from", "cost", "price_usd", "amount")
-_GIC_STOCK_KEYS = ("stock", "stock_quantity", "stock_count", "available", "quantity", "count", "in_stock_count")
+_GIC_STOCK_KEYS = ("stock", "stock_quantity", "stock_count", "available", "available_count", "available_stock",
+                   "stock_available", "quantity", "qty", "remaining", "left", "count", "in_stock_count", "in_stock")
 
 
 def _gic_first_num(o, keys):
@@ -9012,26 +9017,52 @@ def _gic_err(data, status):
     return f"HTTP {status}" if status else "API connection error"
 
 
+_gic_pop_cache = {"t": 0, "counts": {}}
+
+
+def _gic_popularity(dk):
+    """{service_name_lower: কতবার কেনা হয়েছে} — ইউজারদের Gmail/iCloud অর্ডার হিস্ট্রি থেকে (refund বাদে), ৫ মিনিট cache।"""
+    import time as _t
+    if _t.time() - _gic_pop_cache["t"] < 300 and dk in _gic_pop_cache["counts"]:
+        return _gic_pop_cache["counts"][dk]
+    counts = {"g": {}, "i": {}}
+    try:
+        db = load_db()
+        for u in (db.get("users") or {}).values():
+            if not isinstance(u, dict):
+                continue
+            for o in _normalize_orders_list(u.get("orders", [])):
+                if not isinstance(o, dict) or o.get("gic_id") is None or o.get("status") == "refunded":
+                    continue
+                pn = str(o.get("product_name", ""))
+                if "·" not in pn:
+                    continue
+                lab, svc = pn.split("·", 1)
+                k = "g" if "Gmail" in lab else ("i" if "iCloud" in lab else None)
+                if k:
+                    svc = svc.strip().lower()
+                    counts[k][svc] = counts[k].get(svc, 0) + 1
+    except Exception as e:
+        logging.warning(f"gic popularity error: {e}")
+    _gic_pop_cache["t"], _gic_pop_cache["counts"] = _t.time(), counts
+    return counts[dk]
+
+
 def _gic_services_view(dk, page, uid):
-    """সার্ভিস লিস্টের (text, markup) — ২ কলামে inline বাটন "Facebook [2৳]" + Prev/Next।"""
+    """সার্ভিস লিস্টের (text, markup) — ২ কলামে inline বাটন "Facebook [2৳]" + Prev/Next।
+    🔥 সবচেয়ে বেশি কেনা সার্ভিসগুলো আগে (বেশি→কম ক্রমে), বাকিগুলো API এর ক্রমে।"""
     domain, label = GIC_DOMAINS[dk]
-    data, st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/services",
-                             params={"kind": "mail", "page": page, "per_page": GIC_PAGE_SIZE},
-                             headers=_gic_headers(), timeout=12, retries=1, tag="gic services")
-    if not data or data.get("success") is False:
+    allsv = _gic_all_services()
+    if not allsv:
         _em = types.InlineKeyboardMarkup(row_width=1)
         _em.row(InlineBtn("🔙 Back", callback_data="gic_home"))
-        return (f"⚠️ <b>{label}</b>\n\n" + _gic_t(uid, "Could not load the service list: ", "সার্ভিস লিস্ট আনা যায়নি: ")
-                + _gm_e(_gic_err(data, st))), _em
-    items = _gic_list_items(data)
-    _dd = data.get("data")
-    meta = data.get("meta") or (_dd.get("meta") if isinstance(_dd, dict) else None)
-    total_pages = 1
-    if isinstance(meta, dict):
-        try:
-            total_pages = max(1, int(meta.get("total_pages") or 1))
-        except (TypeError, ValueError):
-            total_pages = 1
+        return (f"⚠️ <b>{label}</b>\n\n" + _gic_t(uid, "Could not load the service list.", "সার্ভিস লিস্ট আনা যায়নি।")), _em
+    pop = _gic_popularity(dk)
+    order = {c: i for i, (c, _n, _p) in enumerate(allsv)}
+    ranked = sorted(allsv, key=lambda r: (-pop.get(r[1].strip().lower(), 0), order[r[0]]))
+    total_pages = max(1, -(-len(ranked) // GIC_PAGE_SIZE))
+    page = min(max(1, page), total_pages)
+    items = [{"code": c, "name": n, "price": pr} for c, n, pr in ranked[(page - 1) * GIC_PAGE_SIZE: page * GIC_PAGE_SIZE]]
     markup = types.InlineKeyboardMarkup(row_width=2)
     btns = []
     for sv in items:
@@ -9464,6 +9495,8 @@ def cb_gmail_icloud(call):
             name = _gic_detail_name(det, code)
             _pb = _gic_price_bdt(usd, dk, code)
             price_txt = f"{fmt_bdt_precise(_pb)}৳" if _pb is not None else "—"
+            if stock is None:
+                stock = _gic_stock_cache.get(code)      # ডিটেইলে না থাকলে লিস্টের স্টক ব্যবহার
             avail_txt = f"{int(stock)} pcs" if stock is not None else "—"
             _dom_txt = "@" + str(domain or GIC_DOMAINS[dk][0]).lstrip("@")
             # 🛒 অন্য প্রোডাক্টের মতোই: ডিটেইল মেসেজ + নিচে Reply Keyboard এ "Buy one pice" বাটন
@@ -14082,6 +14115,8 @@ def get_buy_proxy_menu(uid):
             row = []
     if row:
         markup.add(*row)
+    if is_kb_button_enabled("proxy_cdkey"):          # 🔑 এক সারিতে একা: All Proxy CD key
+        markup.add(KbBtn(kb_label("proxy_cdkey"), role="proxy_cdkey"))
     markup.add(KbBtn(LANG[get_user_lang(uid)].get("back", "🔙 Back"), role="back"))
     return markup
 
@@ -14109,6 +14144,9 @@ def handle_proxy_provider_selected(user_id, provider_label, db=None):
     #    show_gb_proxy_menu) — buy flow (show_proxy_provider_products) অপরিবর্তিত। ──
     if provider_label == kb_label("proxy_gb"):
         show_gb_proxy_menu(user_id, lang)
+        return
+    if provider_label == kb_label("proxy_cdkey"):
+        show_cdkey_proxy_menu(user_id, lang)
         return
     # ── ISP Proxy — Admin-যোগ করা ISP প্রোভাইডারগুলো ইনলাইন বাটন হিসেবে দেখায়।
     #    কোনো প্রোভাইডার না থাকলে নিচের generic "coming soon" ব্লক চলবে। ──
@@ -15422,6 +15460,749 @@ def show_gb_proxy_menu(user_id, lang=None):
     else:
         msg = "📦 <b>GB Proxy</b>\n\nChoose a provider below 👇"
     bot.send_message(user_id, msg, parse_mode="HTML", reply_markup=get_gb_proxy_inline_menu(lang))
+
+
+# ═══════════════════════════════════════════════════════════
+# 🔑 ALL PROXY CD KEY — Proxy & VPN সাবমেনুর একা সারির বাটন।
+#    Provider বাটনে ক্লিক → প্যাকেজ লিস্ট ("1Gb [cd key🗝️]•120৳" ...)
+#    প্যাকেজে ক্লিক → Provider/Package/Price/Tutorial + নিচে কীবোর্ড: Buy 1 pcs / Back
+#    Back = এক ধাপ করে পেছনে (প্যাকেজ ডিটেইল → প্যাকেজ লিস্ট → Proxy & VPN মেনু → মেইন মেনু)
+#    ✅ Provider, প্যাকেজের নাম, দাম, Tutorial লিংক, CD key স্টক — সবকিছু
+#       Admin Panel → 🔑 CD Key Manager থেকে বদলানো যায় (স্টক: লেখা পেস্ট বা .txt ফাইল আপলোড)।
+#    ✅ ডাটা: db["settings"]["cdkey_shop"] → "cfg" (JSON স্ট্রিং) + "stock" (প্রতি প্যাকেজে লাইন-ভিত্তিক key)
+#    ✅ CDKEY_PROVIDERS / CDKEY_PACKAGE_GBS শুধু প্রথমবারের ডিফল্ট (seed) — এরপর Admin-ই কন্ট্রোল করে।
+# ═══════════════════════════════════════════════════════════
+CDKEY_PROVIDERS = ["9proxy", "Cli proxy", "ABC proxy", "711 proxy", "Datamplus", "Hubproxy", "Bunny proxy",
+                   "Loki proxy", "1024proxy", "Miyaip proxy", "proxy-001", "Thordata proxy", "Swift proxy",
+                   "Nov proxy", "Helodata proxy", "B2 proxy"]
+CDKEY_PACKAGE_GBS = [1, 2, 5, 10, 15]
+CDKEY_DEFAULT_PRICE = 120
+CDKEY_TAG = "[cd key🗝️]"
+CDKEY_BUY_LABEL = "🛒 Buy 1 pcs"
+_CDKEY_STATE_TTL = 1800
+_CDKEY_MAX_FILE = 5 * 1024 * 1024
+_cdkey_state = {}                          # {user_id: {"pid": str, "kid": str, "ts": time}}
+_cdkey_lock = threading.RLock()
+
+
+def _cdkey_slug(name):
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+def _cdkey_raw(db=None):
+    if db is None:
+        db = load_db()
+    c = (db.get("settings", {}) or {}).get("cdkey_shop")
+    return c if isinstance(c, dict) else {}
+
+def _cdkey_save(cfg):
+    update_db_path("/settings/cdkey_shop/cfg", json.dumps(cfg, ensure_ascii=False), _async=False)
+
+def _cdkey_seed(db=None):
+    """প্রথমবার ডিফল্ট provider/প্যাকেজ বানায়। আগের ভার্সনে সেট করা দাম/টিউটোরিয়াল/স্টক থাকলে সেগুলো নিয়ে আসে।"""
+    with _cdkey_lock:
+        old = _cdkey_raw(db)
+        o_prices, o_tut, o_stock = old.get("prices") or {}, old.get("tutorials") or {}, old.get("stock") or {}
+        n, providers, stock_moves = 0, [], {}
+        for name in CDKEY_PROVIDERS:
+            n += 1
+            pid = f"p{n}"
+            slug = _cdkey_slug(name)
+            pk = []
+            for gb in CDKEY_PACKAGE_GBS:
+                n += 1
+                kid = f"k{n}"
+                try:
+                    price = float(o_prices.get(f"{slug}_{gb}"))
+                    if price <= 0:
+                        raise ValueError
+                except Exception:
+                    price = float(CDKEY_DEFAULT_PRICE)
+                pk.append({"id": kid, "name": f"{gb}Gb", "price": price})
+                s = o_stock.get(f"{slug}_{gb}")
+                if s:
+                    stock_moves[f"{pid}_{kid}"] = s
+            providers.append({"id": pid, "name": name, "tut": str(o_tut.get(slug) or ""), "pk": pk})
+        cfg = {"n": n, "providers": providers}
+        _cdkey_save(cfg)
+        for k, v in stock_moves.items():
+            update_db_path(f"/settings/cdkey_shop/stock/{k}", v, _async=False)
+        return cfg
+
+def _cdkey_cfg(db=None):
+    raw = _cdkey_raw(db).get("cfg")
+    if not raw:
+        return _cdkey_seed(db)
+    try:
+        cfg = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(cfg, dict) and isinstance(cfg.get("providers"), list):
+            return cfg
+    except Exception as e:
+        logging.error(f"cdkey cfg parse error: {e}")
+    return {"n": 0, "providers": []}
+
+def _cdkey_edit(fn):
+    """cfg পড়ে fn(cfg) দিয়ে বদলে সেভ করে (lock সহ)।"""
+    with _cdkey_lock:
+        cfg = _cdkey_cfg()
+        res = fn(cfg)
+        _cdkey_save(cfg)
+        return res
+
+def _cdkey_new_id(cfg, prefix):
+    cfg["n"] = int(cfg.get("n", 0)) + 1
+    return f"{prefix}{cfg['n']}"
+
+def _cdkey_prov(cfg, pid):
+    return next((p for p in cfg.get("providers", []) if p.get("id") == pid), None)
+
+def _cdkey_pkg(prov, kid):
+    return next((k for k in (prov or {}).get("pk", []) if k.get("id") == kid), None) if prov else None
+
+def _cdkey_fmt_price(p):
+    try:
+        p = float(p)
+    except Exception:
+        return str(p)
+    return str(int(p)) if p == int(p) else f"{p:.2f}"
+
+def _cdkey_parse_price(txt):
+    try:
+        v = float(str(txt).translate(str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")).replace("৳", "").replace(",", "").strip())
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+def _cdkey_tutorial_url(prov):
+    url = str((prov or {}).get("tut") or "").strip()
+    if url and not re.match(r"^(https?://|tg://)", url, re.I):
+        url = "https://" + url
+    return url
+
+def _cdkey_stock_list(pid, kid, db=None):
+    raw = (_cdkey_raw(db).get("stock") or {}).get(f"{pid}_{kid}") or ""
+    return [l.strip() for l in str(raw).splitlines() if l.strip()]
+
+def _cdkey_save_stock(pid, kid, keys):
+    update_db_path(f"/settings/cdkey_shop/stock/{pid}_{kid}", "\n".join(keys) if keys else "", _async=False)
+
+def _cdkey_on(x):
+    """provider/package ON কিনা (on ফিল্ড না থাকলে ON ধরা হয়)।"""
+    return (x or {}).get("on", True) is not False
+
+def _cdkey_pkg_label(pkg):
+    return f"{pkg.get('name', 'Package')} {CDKEY_TAG}•{_cdkey_fmt_price(pkg.get('price', 0))}৳"
+
+def _cdkey_back_texts():
+    s = set()
+    for lg in ("en", "bn"):
+        try:
+            s.add(LANG[lg].get("back", "🔙 Back"))
+            s.add(KbBtn(LANG[lg].get("back", "🔙 Back"), role="back").text)
+        except Exception:
+            pass
+    return {x for x in s if x}
+
+def _cdkey_cancel_texts():
+    s = {"❌ Cancel"}
+    for lg in ("en", "bn"):
+        try:
+            s.add(LANG[lg].get("cancel", "❌ Cancel"))
+            s.add(KbBtn(LANG[lg].get("cancel", "❌ Cancel"), role="cancel").text)
+        except Exception:
+            pass
+    return s
+
+def _esc(x):
+    return _bm_html.escape(str(x))
+
+
+# ───────────────────────── USER SIDE ─────────────────────────
+def _cdkey_menu_markup(lang):
+    cfg = _cdkey_cfg()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    btns = [InlineBtn(p["name"], style="primary", callback_data=f"cdkey_go_{p['id']}") for p in cfg["providers"] if _cdkey_on(p)]
+    if btns:
+        markup.add(*btns)
+    markup.add(InlineBtn("❌ ক্যানসেল" if lang == "bn" else "❌ Cancel",
+                         style=_ik("inline_proxy_cancel"), callback_data="cdkey_cancel"))
+    return markup
+
+def _cdkey_menu_text(lang):
+    return ("🔑 <b>All Proxy CD key</b>\n\nনিচে থেকে একটা প্রোভাইডার বেছে নিন 👇" if lang == "bn"
+            else "🔑 <b>All Proxy CD key</b>\n\nChoose a provider below 👇")
+
+def show_cdkey_proxy_menu(user_id, lang=None):
+    if lang is None:
+        lang = get_user_lang(user_id)
+    bot.send_message(user_id, _cdkey_menu_text(lang), parse_mode="HTML", reply_markup=_cdkey_menu_markup(lang))
+
+def _cdkey_packages_view(lang, pid):
+    prov = _cdkey_prov(_cdkey_cfg(), pid)
+    if not prov or not _cdkey_on(prov):
+        return ("⚠️ এই প্রোভাইডার এখন বন্ধ আছে।" if lang == "bn" else "⚠️ This provider is currently unavailable."), None
+    pks = [k for k in prov.get("pk", []) if _cdkey_on(k)]
+    if pks:
+        text = (f"🔑 <b>{_esc(prov['name'])}</b>\n\nএকটা প্যাকেজ বেছে নিন 👇" if lang == "bn"
+                else f"🔑 <b>{_esc(prov['name'])}</b>\n\nSelect a package 👇")
+    else:
+        text = (f"🔑 <b>{_esc(prov['name'])}</b>\n\n⚠️ এখনো কোনো প্যাকেজ নেই।" if lang == "bn"
+                else f"🔑 <b>{_esc(prov['name'])}</b>\n\n⚠️ No packages yet.")
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for pkg in pks:
+        markup.add(InlineBtn(_cdkey_pkg_label(pkg), style=_ik("inline_proxy_package"),
+                             callback_data=f"cdkey_pk_{pid}_{pkg['id']}"))
+    markup.add(InlineBtn("🔙 Back", style=_ik("inline_proxy_back"), callback_data="cdkey_back"))
+    return text, markup
+
+def _cdkey_detail_text(prov, pkg):
+    lines = [
+        f"📡 <b>Provider:</b> {_esc(prov['name'])}",
+        f"📦 <b>Package:</b> {_esc(pkg['name'])} {CDKEY_TAG}",
+        f"💰 <b>Price:</b> {_cdkey_fmt_price(pkg['price'])}৳",
+    ]
+    tut = _cdkey_tutorial_url(prov)
+    if tut:                                   # ভিডিও লিংক সেট থাকলেই দেখাবে
+        lines.append(f"🎥 <b>Tutorial:</b> <a href=\"{_bm_html.escape(tut, quote=True)}\">Watch Video</a>")
+    return "\n".join(lines)
+
+def _cdkey_kb_markup(lang):
+    mk = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
+    mk.add(KbBtn(CDKEY_BUY_LABEL, style="success"))
+    mk.add(KbBtn(LANG[lang].get("back", "🔙 Back"), role="back"))
+    return mk
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("cdkey_go_") or call.data.startswith("cdkey_pk_")
+                            or call.data in ("cdkey_cancel", "cdkey_back"))
+def handle_cdkey_proxy_callback(call):
+    bot.answer_callback_query(call.id)
+    _EXECUTOR.submit(_cdkey_user_cb_worker, call)
+
+def _cdkey_user_cb_worker(call):
+    try:
+        user_id = str(call.message.chat.id)
+        lang = get_user_lang(user_id)
+        cid, mid, d = call.message.chat.id, call.message.message_id, call.data
+        if d == "cdkey_cancel":
+            _cdkey_state.pop(user_id, None)
+            bot.edit_message_text("❌ ক্যানসেল করা হয়েছে।" if lang == "bn" else "❌ Cancelled.", chat_id=cid, message_id=mid)
+        elif d == "cdkey_back":
+            bot.edit_message_text(_cdkey_menu_text(lang), chat_id=cid, message_id=mid,
+                                  parse_mode="HTML", reply_markup=_cdkey_menu_markup(lang))
+        elif d.startswith("cdkey_go_"):
+            text, markup = _cdkey_packages_view(lang, d[len("cdkey_go_"):])
+            if markup is None:
+                bot.edit_message_text(text, chat_id=cid, message_id=mid, reply_markup=_cdkey_menu_markup(lang))
+            else:
+                bot.edit_message_text(text, chat_id=cid, message_id=mid, parse_mode="HTML", reply_markup=markup)
+        elif d.startswith("cdkey_pk_"):
+            pid, kid = d[len("cdkey_pk_"):].split("_", 1)
+            prov = _cdkey_prov(_cdkey_cfg(), pid)
+            pkg = _cdkey_pkg(prov, kid)
+            if not pkg or not _cdkey_on(prov) or not _cdkey_on(pkg):
+                bot.send_message(user_id, "⚠️ প্যাকেজটি এখন বন্ধ আছে।" if lang == "bn" else "⚠️ This package is currently unavailable.")
+                return
+            _cdkey_state[user_id] = {"pid": pid, "kid": kid, "ts": _time_module.time()}
+            bot.send_message(user_id, _cdkey_detail_text(prov, pkg), parse_mode="HTML",
+                             disable_web_page_preview=True, reply_markup=_cdkey_kb_markup(lang))
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logging.warning(f"cdkey callback error: {e}")
+
+
+def _cdkey_is_active_text(message):
+    """শুধু প্যাকেজ ডিটেইল খোলা থাকলে Buy/Back টেক্সট ধরবে। অন্য কিছু চাপলে state মুছে দেয়।"""
+    try:
+        uid = str(message.chat.id)
+        st = _cdkey_state.get(uid)
+        if not st:
+            return False
+        if _time_module.time() - st.get("ts", 0) > _CDKEY_STATE_TTL:
+            _cdkey_state.pop(uid, None)
+            return False
+        text = message.text or ""
+        if text == CDKEY_BUY_LABEL or text in _cdkey_back_texts():
+            return True
+        _cdkey_state.pop(uid, None)
+        return False
+    except Exception:
+        return False
+
+@bot.message_handler(func=_cdkey_is_active_text)
+def handle_cdkey_kb_text(message):
+    _EXECUTOR.submit(_cdkey_kb_text_worker, message)
+
+def _cdkey_kb_text_worker(message):
+    uid = str(message.chat.id)
+    try:
+        st = _cdkey_state.get(uid)
+        if not st:
+            return
+        text = message.text or ""
+        lang = get_user_lang(uid)
+        if not is_admin(uid) and not is_subscribed(uid):
+            _cdkey_state.pop(uid, None)
+            _text_message_worker(message)      # join-gate দেখাবে
+            return
+        if text == CDKEY_BUY_LABEL:
+            _cdkey_buy(uid, lang, st)
+            return
+        # 🔙 Back — এক ধাপ পেছনে: প্যাকেজ লিস্ট + Proxy & VPN কীবোর্ড ফিরিয়ে আনো
+        _cdkey_state.pop(uid, None)
+        bot.send_message(uid, "🔑 <b>All Proxy CD key</b>", parse_mode="HTML", reply_markup=get_buy_proxy_menu(uid))
+        t_, m_ = _cdkey_packages_view(lang, st["pid"])
+        bot.send_message(uid, t_, parse_mode="HTML", reply_markup=m_ or _cdkey_menu_markup(lang))
+    except Exception as e:
+        logging.error(f"cdkey kb text error: {e}\n{traceback.format_exc()}")
+
+def _cdkey_buy(uid, lang, st):
+    pid, kid = st["pid"], st["kid"]
+    if not _try_acquire_in_flight(uid):
+        bot.send_message(uid, "⏳ আগের অর্ডার প্রসেস হচ্ছে, একটু অপেক্ষা করুন।" if lang == "bn"
+                         else "⏳ Your previous order is processing, please wait.")
+        return
+    key = None
+    try:
+        with _cdkey_lock:
+            db = load_db()
+            if uid in db.get("banned_users", {}):
+                bot.send_message(uid, LANG["en"]["banned"], parse_mode="HTML")
+                return
+            prov = _cdkey_prov(_cdkey_cfg(db), pid)
+            pkg = _cdkey_pkg(prov, kid)
+            if not pkg or not _cdkey_on(prov) or not _cdkey_on(pkg):
+                _cdkey_state.pop(uid, None)
+                bot.send_message(uid, "⚠️ প্যাকেজটি এখন বন্ধ আছে বা আর নেই।" if lang == "bn" else "⚠️ This package is currently unavailable.")
+                return
+            name, pname_short = prov["name"], pkg["name"]
+            price = float(pkg.get("price") or 0)
+            balance = float((db.get("users", {}).get(uid, {}) or {}).get("balance", 0) or 0)
+            keys = _cdkey_stock_list(pid, kid, db)
+            if not keys:
+                bot.send_message(uid, "❌ <b>স্টক শেষ!</b>\nএই প্যাকেজটি এখন স্টকে নেই, পরে আবার চেষ্টা করুন।" if lang == "bn"
+                                 else "❌ <b>Out of stock!</b>\nThis package is currently unavailable, please try later.",
+                                 parse_mode="HTML")
+                return
+            if balance < price:
+                shortage = round(price - balance, 2)
+                bot.send_message(uid,
+                    (f"❌ ব্যালেন্স অপর্যাপ্ত! প্রয়োজন ৳{_cdkey_fmt_price(price)}, আপনার আছে ৳{balance} (৳{shortage} কম)."
+                     if lang == "bn" else
+                     f"❌ Insufficient balance! Need ৳{_cdkey_fmt_price(price)}, you have ৳{balance} (short ৳{shortage})."))
+                return
+            key = keys.pop(0)
+            _cdkey_save_stock(pid, kid, keys)
+            try:
+                new_balance = round(balance - price, 2)
+                db["users"][uid]["balance"] = new_balance
+                update_db_path(f"/users/{uid}/balance", new_balance, _async=False)
+                order_id = f"CDK-{uuid.uuid4().hex[:8].upper()}"
+                now_str = get_now()
+                pname = f"{name} - {pname_short} {CDKEY_TAG}"
+                orders = _normalize_orders_list(db["users"][uid].get("orders", []))
+                orders.append({
+                    "order_id": order_id, "id": order_id, "product": pname, "product_name": pname,
+                    "price": price, "total": price, "quantity": 1, "date": now_str,
+                    "type": "cdkey", "provider": name, "package": pname_short, "key": key,
+                })
+                db["users"][uid]["orders"] = orders
+                update_db_path(f"/users/{uid}/orders", orders, _async=False)
+            except Exception:
+                # কিছু ভুল হলে key স্টকে ফেরত দাও, ব্যালেন্স আগের অবস্থায় ফেরাও
+                try:
+                    _cdkey_save_stock(pid, kid, [key] + keys)
+                    update_db_path(f"/users/{uid}/balance", balance, _async=False)
+                except Exception:
+                    pass
+                raise
+        # ── সফল: ডেলিভারি ──
+        bot.send_message(uid,
+            f"✅ <b>Purchase Successful!</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 <b>Provider:</b> {_esc(name)}\n"
+            f"📦 <b>Package:</b> {_esc(pname_short)} {CDKEY_TAG}\n"
+            f"💵 <b>Price Paid:</b> {_cdkey_fmt_price(price)}৳\n"
+            f"💰 <b>New Balance:</b> {new_balance}৳\n\n"
+            f"🔑 <b>CD Key:</b>\n<code>{_esc(key)}</code>\n\n"
+            f"🆔 <b>Order ID:</b> <code>{order_id}</code>\n"
+            + ("✅ কী-টি সাবধানে সংরক্ষণ করুন।" if lang == "bn" else "✅ Save this key securely."),
+            parse_mode="HTML", reply_markup=_cdkey_kb_markup(lang))
+        try:
+            bot.send_message(LOG_CHANNEL_ID,
+                f"🛒 <b>Purchase Successful!</b>🎉\n\n"
+                f"👤 <b>User ID:</b> <code>{mask_id(uid)}</code>\n"
+                f"📦 <b>Product:</b> {_esc(name)} — {_esc(pname_short)} {CDKEY_TAG}\n"
+                f"💰 <b>Total:</b> {_cdkey_fmt_price(price)} BDT\n"
+                f"🆔 <b>Order ID:</b> <code>{mask_id(order_id)}</code>\n"
+                f"✅ <b>Status:</b> Delivered\n📅 <b>Date:</b> {now_str}", parse_mode="HTML")
+        except Exception:
+            pass
+        if not keys:
+            try:
+                bot.send_message(ADMIN_ID, f"⚠️ <b>CD Key স্টক শেষ!</b>\n{_esc(name)} — {_esc(pname_short)} {CDKEY_TAG}\n"
+                                           f"Admin Panel → 🔑 CD Key Manager থেকে নতুন key যোগ করুন।", parse_mode="HTML")
+            except Exception:
+                pass
+    except Exception as e:
+        logging.error(f"cdkey buy error: {e}\n{traceback.format_exc()}")
+        try:
+            bot.send_message(uid, "❌ কিছু সমস্যা হয়েছে, আবার চেষ্টা করুন।" if lang == "bn"
+                             else "❌ Something went wrong, please try again.")
+        except Exception:
+            pass
+    finally:
+        _release_in_flight(uid)
+
+
+# ───────────────────────── ADMIN SIDE ─────────────────────────
+def _cdkey_admin_show(chat_id, mid, text, markup):
+    try:
+        if mid:
+            bot.edit_message_text(text, chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                                  reply_markup=markup, disable_web_page_preview=True)
+            return
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            return
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+
+def _cdkey_admin_providers_view():
+    cfg = _cdkey_cfg()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    btns = [InlineBtn(("🟢 " if _cdkey_on(p) else "🔴 ") + p["name"], style="primary", callback_data=f"admin_cdkey_prov_{p['id']}") for p in cfg["providers"]]
+    if btns:
+        markup.add(*btns)
+    markup.add(InlineBtn("➕ Provider যোগ করুন", style="success", callback_data="admin_cdkey_padd"))
+    markup.add(InlineBtn("🔙 Admin Panel", style="primary", callback_data="back_admin"))
+    return "🔑 <b>CD Key Manager</b>\n\nপ্রোভাইডার বেছে নিন, অথবা নতুন যোগ করুন 👇", markup
+
+def _cdkey_admin_provider_view(pid):
+    db = load_db()
+    prov = _cdkey_prov(_cdkey_cfg(db), pid)
+    if not prov:
+        return _cdkey_admin_providers_view()
+    tut = _cdkey_tutorial_url(prov)
+    text = (f"🔑 <b>{_esc(prov['name'])}</b> — {'🟢 ON' if _cdkey_on(prov) else '🔴 OFF (ইউজার দেখবে না)'}\n\n"
+            f"🎥 Tutorial: {('<code>' + _esc(tut) + '</code>') if tut else 'সেট করা নেই (ইউজার দেখবে না)'}\n"
+            f"📦 প্যাকেজ: {len(prov.get('pk', []))} টি")
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for pkg in prov.get("pk", []):
+        markup.add(InlineBtn(f"{'🟢' if _cdkey_on(pkg) else '🔴'} {pkg['name']} • {_cdkey_fmt_price(pkg['price'])}৳ • 📦 {len(_cdkey_stock_list(pid, pkg['id'], db))}",
+                             style="primary", callback_data=f"admin_cdkey_pkg_{pid}_{pkg['id']}"))
+    markup.add(InlineBtn("➕ Package যোগ করুন", style="success", callback_data=f"admin_cdkey_kadd_{pid}"))
+    markup.add(InlineBtn("🔴 Provider OFF করুন" if _cdkey_on(prov) else "🟢 Provider ON করুন", style="primary",
+                         callback_data=f"admin_cdkey_ptog_{pid}"))
+    markup.add(InlineBtn("🎥 Tutorial Link সেট/বদলান", style="primary", callback_data=f"admin_cdkey_tut_{pid}"))
+    markup.add(InlineBtn("✏️ Provider নাম বদলান", style="primary", callback_data=f"admin_cdkey_prn_{pid}"))
+    markup.add(InlineBtn("🗑 Provider মুছুন", style="danger", callback_data=f"admin_cdkey_pdel_{pid}"))
+    markup.add(InlineBtn("🔙 Back", style="primary", callback_data="admin_cdkey_manage"))
+    return text, markup
+
+def _cdkey_admin_package_view(pid, kid):
+    db = load_db()
+    prov = _cdkey_prov(_cdkey_cfg(db), pid)
+    pkg = _cdkey_pkg(prov, kid)
+    if not pkg:
+        return _cdkey_admin_provider_view(pid)
+    n = len(_cdkey_stock_list(pid, kid, db))
+    text = (f"🔑 <b>{_esc(prov['name'])}</b> — {_esc(pkg['name'])} {CDKEY_TAG}\n"
+            f"{'🟢 ON' if _cdkey_on(pkg) else '🔴 OFF (ইউজার দেখবে না)'}\n\n"
+            f"💰 দাম: <b>{_cdkey_fmt_price(pkg['price'])}৳</b>\n📦 স্টক: <b>{n}</b> টি key")
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineBtn("🔴 Package OFF করুন" if _cdkey_on(pkg) else "🟢 Package ON করুন", style="primary",
+                         callback_data=f"admin_cdkey_ktog_{pid}_{kid}"))
+    markup.add(InlineBtn("💰 দাম সেট করুন", style="primary", callback_data=f"admin_cdkey_price_{pid}_{kid}"))
+    markup.add(InlineBtn("➕ Stock যোগ (লেখা / ফাইল)", style="success", callback_data=f"admin_cdkey_stock_{pid}_{kid}"))
+    if n:
+        markup.add(InlineBtn("📄 Stock ফাইল ডাউনলোড", style="primary", callback_data=f"admin_cdkey_dl_{pid}_{kid}"))
+        markup.add(InlineBtn("🗑 সব Key মুছুন", style="danger", callback_data=f"admin_cdkey_clr_{pid}_{kid}"))
+    markup.add(InlineBtn("✏️ Package নাম বদলান", style="primary", callback_data=f"admin_cdkey_krn_{pid}_{kid}"))
+    markup.add(InlineBtn("🗑 Package মুছুন", style="danger", callback_data=f"admin_cdkey_kdel_{pid}_{kid}"))
+    markup.add(InlineBtn("🔙 Back", style="primary", callback_data=f"admin_cdkey_prov_{pid}"))
+    return text, markup
+
+def _cdkey_confirm_markup(yes_cb, no_cb):
+    mk = types.InlineKeyboardMarkup(row_width=2)
+    mk.add(InlineBtn("✅ হ্যাঁ, মুছুন", style="danger", callback_data=yes_cb),
+           InlineBtn("❌ না", style="primary", callback_data=no_cb))
+    return mk
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_cdkey_"))
+def handle_admin_cdkey_callback(call):
+    if not is_admin(call.message.chat.id):
+        bot.answer_callback_query(call.id, "❌ Admin access only!", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    _EXECUTOR.submit(_admin_cdkey_cb_worker, call)
+
+def _admin_cdkey_cb_worker(call):
+    try:
+        chat_id, mid, d = call.message.chat.id, call.message.message_id, call.data
+        def ids(prefix):
+            return d[len(prefix):].split("_")
+        def show(tm):
+            _cdkey_admin_show(chat_id, mid, tm[0], tm[1])
+        def ask(text, handler, *args, markup=None):
+            msg = bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup or get_cancel_button(chat_id),
+                                   disable_web_page_preview=True)
+            bot.register_next_step_handler(msg, handler, *args)
+
+        cfg = _cdkey_cfg()
+        if d == "admin_cdkey_manage":
+            show(_cdkey_admin_providers_view())
+        elif d == "admin_cdkey_padd":
+            ask("➕ <b>নতুন Provider এর নাম লিখুন</b>\n<i>যেমন: 9proxy</i>", _cdkey_admin_padd_step)
+        elif d.startswith("admin_cdkey_prov_"):
+            show(_cdkey_admin_provider_view(ids("admin_cdkey_prov_")[0]))
+        elif d.startswith("admin_cdkey_ptog_"):
+            pid = ids("admin_cdkey_ptog_")[0]
+            def _pt(c):
+                p = _cdkey_prov(c, pid)
+                if p: p["on"] = not _cdkey_on(p)
+            _cdkey_edit(_pt)
+            show(_cdkey_admin_provider_view(pid))
+        elif d.startswith("admin_cdkey_ktog_"):
+            pid, kid = ids("admin_cdkey_ktog_")
+            def _kt(c):
+                k = _cdkey_pkg(_cdkey_prov(c, pid), kid)
+                if k: k["on"] = not _cdkey_on(k)
+            _cdkey_edit(_kt)
+            show(_cdkey_admin_package_view(pid, kid))
+        elif d.startswith("admin_cdkey_prn_"):
+            pid = ids("admin_cdkey_prn_")[0]
+            ask("✏️ <b>Provider এর নতুন নাম লিখুন</b>", _cdkey_admin_prn_step, pid)
+        elif d.startswith("admin_cdkey_pdok_"):
+            pid = ids("admin_cdkey_pdok_")[0]
+            def _del(c):
+                p = _cdkey_prov(c, pid)
+                if p:
+                    for k in p.get("pk", []):
+                        _cdkey_save_stock(pid, k["id"], [])
+                c["providers"] = [x for x in c["providers"] if x.get("id") != pid]
+            _cdkey_edit(_del)
+            show(_cdkey_admin_providers_view())
+        elif d.startswith("admin_cdkey_pdel_"):
+            pid = ids("admin_cdkey_pdel_")[0]
+            p = _cdkey_prov(cfg, pid)
+            if p:
+                _cdkey_admin_show(chat_id, mid, f"⚠️ <b>{_esc(p['name'])}</b> Provider ও এর সব প্যাকেজ/key মুছে ফেলবেন?",
+                                  _cdkey_confirm_markup(f"admin_cdkey_pdok_{pid}", f"admin_cdkey_prov_{pid}"))
+        elif d.startswith("admin_cdkey_tutclr_"):
+            pid = ids("admin_cdkey_tutclr_")[0]
+            def _c(c):
+                p = _cdkey_prov(c, pid)
+                if p: p["tut"] = ""
+            _cdkey_edit(_c)
+            show(_cdkey_admin_provider_view(pid))
+        elif d.startswith("admin_cdkey_tut_"):
+            pid = ids("admin_cdkey_tut_")[0]
+            p = _cdkey_prov(cfg, pid)
+            if not p:
+                return
+            cur = _cdkey_tutorial_url(p)
+            mk = types.InlineKeyboardMarkup(row_width=1)
+            if cur:
+                mk.add(InlineBtn("❌ লিংক মুছুন (Tutorial লুকান)", style="danger", callback_data=f"admin_cdkey_tutclr_{pid}"))
+            mk.add(InlineBtn("🔙 Back", style="primary", callback_data=f"admin_cdkey_prov_{pid}"))
+            ask(f"🎥 <b>{_esc(p['name'])} — Tutorial Link</b>\n\nবর্তমান: "
+                f"{('<code>' + _esc(cur) + '</code>') if cur else 'সেট করা নেই (ইউজার দেখবে না)'}\n\nনতুন ভিডিও লিংক পাঠান।",
+                _cdkey_admin_tut_step, pid, markup=mk)
+        elif d.startswith("admin_cdkey_kadd_"):
+            pid = ids("admin_cdkey_kadd_")[0]
+            ask("➕ <b>নতুন Package এর নাম লিখুন</b>\n<i>যেমন: 1Gb</i>", _cdkey_admin_kadd_name_step, pid)
+        elif d.startswith("admin_cdkey_pkg_"):
+            pid, kid = ids("admin_cdkey_pkg_")
+            show(_cdkey_admin_package_view(pid, kid))
+        elif d.startswith("admin_cdkey_krn_"):
+            pid, kid = ids("admin_cdkey_krn_")
+            ask("✏️ <b>Package এর নতুন নাম লিখুন</b>\n<i>যেমন: 1Gb</i>", _cdkey_admin_krn_step, pid, kid)
+        elif d.startswith("admin_cdkey_price_"):
+            pid, kid = ids("admin_cdkey_price_")
+            ask("💰 <b>নতুন দাম লিখুন</b> (টাকায়, যেমন: <code>120</code>)", _cdkey_admin_price_step, pid, kid)
+        elif d.startswith("admin_cdkey_stock_"):
+            pid, kid = ids("admin_cdkey_stock_")
+            ask("➕ <b>Stock যোগ করুন</b>\n\n• key গুলো <b>পেস্ট</b> করুন — প্রতি লাইনে একটা, অথবা\n"
+                "• একটা <b>.txt ফাইল আপলোড</b> করুন (প্রতি লাইনে একটা key)\n\n<i>অনেক key হলে ফাইল আপলোড করাই ভালো।</i>",
+                _cdkey_admin_stock_step, pid, kid)
+        elif d.startswith("admin_cdkey_dl_"):
+            pid, kid = ids("admin_cdkey_dl_")
+            keys = _cdkey_stock_list(pid, kid)
+            if keys:
+                bio = BytesIO("\n".join(keys).encode("utf-8")); bio.name = f"cdkey_{pid}_{kid}_stock.txt"
+                bot.send_document(chat_id, bio, caption=f"📄 স্টক: {len(keys)} টি key")
+        elif d.startswith("admin_cdkey_clrok_"):
+            pid, kid = ids("admin_cdkey_clrok_")
+            _cdkey_save_stock(pid, kid, [])
+            t_, m_ = _cdkey_admin_package_view(pid, kid)
+            _cdkey_admin_show(chat_id, mid, "✅ সব key মুছে ফেলা হয়েছে।\n\n" + t_, m_)
+        elif d.startswith("admin_cdkey_clr_"):
+            pid, kid = ids("admin_cdkey_clr_")
+            _cdkey_admin_show(chat_id, mid, "⚠️ এই প্যাকেজের <b>সব key</b> মুছে ফেলবেন?",
+                              _cdkey_confirm_markup(f"admin_cdkey_clrok_{pid}_{kid}", f"admin_cdkey_pkg_{pid}_{kid}"))
+        elif d.startswith("admin_cdkey_kdok_"):
+            pid, kid = ids("admin_cdkey_kdok_")
+            def _kd(c):
+                p = _cdkey_prov(c, pid)
+                if p:
+                    p["pk"] = [k for k in p.get("pk", []) if k.get("id") != kid]
+            _cdkey_edit(_kd)
+            _cdkey_save_stock(pid, kid, [])
+            show(_cdkey_admin_provider_view(pid))
+        elif d.startswith("admin_cdkey_kdel_"):
+            pid, kid = ids("admin_cdkey_kdel_")
+            pkg = _cdkey_pkg(_cdkey_prov(cfg, pid), kid)
+            if pkg:
+                _cdkey_admin_show(chat_id, mid, f"⚠️ <b>{_esc(pkg['name'])}</b> প্যাকেজ ও এর সব key মুছে ফেলবেন?",
+                                  _cdkey_confirm_markup(f"admin_cdkey_kdok_{pid}_{kid}", f"admin_cdkey_pkg_{pid}_{kid}"))
+    except Exception as e:
+        logging.error(f"admin cdkey cb error: {e}\n{traceback.format_exc()}")
+
+
+# ── Admin text/file steps ──
+def _cdkey_step_text(message):
+    return (message.text or "").strip() if getattr(message, "content_type", "text") == "text" else ""
+
+def _cdkey_done(uid, note, view):
+    bot.send_message(uid, note, parse_mode="HTML", reply_markup=get_main_menu(uid))
+    bot.send_message(uid, view[0], parse_mode="HTML", reply_markup=view[1], disable_web_page_preview=True)
+
+def _cdkey_admin_padd_step(message):
+    uid, txt = str(message.chat.id), _cdkey_step_text(message)
+    if txt in _cdkey_cancel_texts():
+        v = _cdkey_admin_providers_view(); bot.send_message(uid, v[0], parse_mode="HTML", reply_markup=v[1]); return
+    if not txt or len(txt) > 40:
+        msg = bot.send_message(uid, "❌ <b>সঠিক নাম লিখুন</b> (সর্বোচ্চ ৪০ অক্ষর)", parse_mode="HTML", reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_padd_step); return
+    def _add(c):
+        pid = _cdkey_new_id(c, "p")
+        c["providers"].append({"id": pid, "name": txt, "tut": "", "pk": []})
+        return pid
+    pid = _cdkey_edit(_add)
+    _cdkey_done(uid, f"✅ <b>{_esc(txt)}</b> যোগ হয়েছে! এখন প্যাকেজ যোগ করুন।", _cdkey_admin_provider_view(pid))
+
+def _cdkey_admin_prn_step(message, pid):
+    uid, txt = str(message.chat.id), _cdkey_step_text(message)
+    if txt in _cdkey_cancel_texts():
+        v = _cdkey_admin_provider_view(pid); bot.send_message(uid, v[0], parse_mode="HTML", reply_markup=v[1]); return
+    if not txt or len(txt) > 40:
+        msg = bot.send_message(uid, "❌ <b>সঠিক নাম লিখুন</b> (সর্বোচ্চ ৪০ অক্ষর)", parse_mode="HTML", reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_prn_step, pid); return
+    def _r(c):
+        p = _cdkey_prov(c, pid)
+        if p: p["name"] = txt
+    _cdkey_edit(_r)
+    _cdkey_done(uid, "✅ <b>নাম আপডেট হয়েছে!</b>", _cdkey_admin_provider_view(pid))
+
+def _cdkey_admin_tut_step(message, pid):
+    uid, txt = str(message.chat.id), _cdkey_step_text(message)
+    if txt in _cdkey_cancel_texts():
+        v = _cdkey_admin_provider_view(pid); bot.send_message(uid, v[0], parse_mode="HTML", reply_markup=v[1], disable_web_page_preview=True); return
+    if not txt or " " in txt or "\n" in txt:
+        msg = bot.send_message(uid, "❌ <b>সঠিক লিংক দিন:</b>", parse_mode="HTML", reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_tut_step, pid); return
+    def _t(c):
+        p = _cdkey_prov(c, pid)
+        if p: p["tut"] = txt
+    _cdkey_edit(_t)
+    _cdkey_done(uid, "✅ <b>Tutorial লিংক সেট হয়েছে!</b>", _cdkey_admin_provider_view(pid))
+
+def _cdkey_admin_kadd_name_step(message, pid):
+    uid, txt = str(message.chat.id), _cdkey_step_text(message)
+    if txt in _cdkey_cancel_texts():
+        v = _cdkey_admin_provider_view(pid); bot.send_message(uid, v[0], parse_mode="HTML", reply_markup=v[1]); return
+    if not txt or len(txt) > 40:
+        msg = bot.send_message(uid, "❌ <b>সঠিক নাম লিখুন</b> (সর্বোচ্চ ৪০ অক্ষর)", parse_mode="HTML", reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_kadd_name_step, pid); return
+    msg = bot.send_message(uid, f"💰 <b>{_esc(txt)}</b> এর দাম লিখুন (টাকায়, যেমন: <code>120</code>)", parse_mode="HTML",
+                           reply_markup=get_cancel_button(uid))
+    bot.register_next_step_handler(msg, _cdkey_admin_kadd_price_step, pid, txt)
+
+def _cdkey_admin_kadd_price_step(message, pid, name):
+    uid, txt = str(message.chat.id), _cdkey_step_text(message)
+    if txt in _cdkey_cancel_texts():
+        v = _cdkey_admin_provider_view(pid); bot.send_message(uid, v[0], parse_mode="HTML", reply_markup=v[1]); return
+    price = _cdkey_parse_price(txt)
+    if price is None:
+        msg = bot.send_message(uid, "❌ <b>সঠিক দাম লিখুন</b> (যেমন: 120)", parse_mode="HTML", reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_kadd_price_step, pid, name); return
+    def _add(c):
+        p = _cdkey_prov(c, pid)
+        if not p: return None
+        kid = _cdkey_new_id(c, "k")
+        p.setdefault("pk", []).append({"id": kid, "name": name, "price": price})
+        return kid
+    kid = _cdkey_edit(_add)
+    if kid:
+        _cdkey_done(uid, f"✅ <b>{_esc(name)}</b> প্যাকেজ যোগ হয়েছে! এখন Stock যোগ করুন।", _cdkey_admin_package_view(pid, kid))
+    else:
+        _cdkey_done(uid, "⚠️ Provider পাওয়া যায়নি।", _cdkey_admin_providers_view())
+
+def _cdkey_admin_krn_step(message, pid, kid):
+    uid, txt = str(message.chat.id), _cdkey_step_text(message)
+    if txt in _cdkey_cancel_texts():
+        v = _cdkey_admin_package_view(pid, kid); bot.send_message(uid, v[0], parse_mode="HTML", reply_markup=v[1]); return
+    if not txt or len(txt) > 40:
+        msg = bot.send_message(uid, "❌ <b>সঠিক নাম লিখুন</b> (সর্বোচ্চ ৪০ অক্ষর)", parse_mode="HTML", reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_krn_step, pid, kid); return
+    def _r(c):
+        k = _cdkey_pkg(_cdkey_prov(c, pid), kid)
+        if k: k["name"] = txt
+    _cdkey_edit(_r)
+    _cdkey_done(uid, "✅ <b>নাম আপডেট হয়েছে!</b>", _cdkey_admin_package_view(pid, kid))
+
+def _cdkey_admin_price_step(message, pid, kid):
+    uid, txt = str(message.chat.id), _cdkey_step_text(message)
+    if txt in _cdkey_cancel_texts():
+        v = _cdkey_admin_package_view(pid, kid); bot.send_message(uid, v[0], parse_mode="HTML", reply_markup=v[1]); return
+    price = _cdkey_parse_price(txt)
+    if price is None:
+        msg = bot.send_message(uid, "❌ <b>সঠিক দাম লিখুন</b> (যেমন: 120)", parse_mode="HTML", reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_price_step, pid, kid); return
+    def _p(c):
+        k = _cdkey_pkg(_cdkey_prov(c, pid), kid)
+        if k: k["price"] = price
+    _cdkey_edit(_p)
+    _cdkey_done(uid, "✅ <b>দাম আপডেট হয়েছে!</b>", _cdkey_admin_package_view(pid, kid))
+
+def _cdkey_admin_stock_step(message, pid, kid):
+    """Stock — লেখা পেস্ট (প্রতি লাইনে একটা key) অথবা .txt/.csv ফাইল আপলোড।"""
+    uid = str(message.chat.id)
+    ctype = getattr(message, "content_type", "text")
+    if ctype == "text" and (message.text or "").strip() in _cdkey_cancel_texts():
+        v = _cdkey_admin_package_view(pid, kid); bot.send_message(uid, v[0], parse_mode="HTML", reply_markup=v[1]); return
+    raw_text = ""
+    try:
+        if ctype == "document" and message.document:
+            doc = message.document
+            fname = (doc.file_name or "").lower()
+            if fname and not fname.endswith((".txt", ".csv", ".text", ".list")):
+                raise ValueError("শুধু .txt বা .csv ফাইল দিন")
+            if doc.file_size and doc.file_size > _CDKEY_MAX_FILE:
+                raise ValueError("ফাইল ৫MB এর বেশি বড়")
+            data = bot.download_file(bot.get_file(doc.file_id).file_path)
+            try:
+                raw_text = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raw_text = data.decode("latin-1")
+        elif ctype == "text":
+            raw_text = message.text or ""
+        else:
+            raise ValueError("লেখা পেস্ট করুন বা .txt ফাইল দিন")
+    except Exception as e:
+        msg = bot.send_message(uid, f"❌ <b>{_esc(e)}</b>\n\nআবার চেষ্টা করুন — key পেস্ট করুন অথবা .txt ফাইল দিন।",
+                               parse_mode="HTML", reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_stock_step, pid, kid); return
+    new_keys = [l.strip() for l in raw_text.splitlines() if l.strip()]
+    if not new_keys:
+        msg = bot.send_message(uid, "❌ <b>কোনো key পাওয়া যায়নি</b> (প্রতি লাইনে একটা key দিন)", parse_mode="HTML",
+                               reply_markup=get_cancel_button(uid))
+        bot.register_next_step_handler(msg, _cdkey_admin_stock_step, pid, kid); return
+    with _cdkey_lock:
+        cur = _cdkey_stock_list(pid, kid)
+        cur.extend(new_keys)          # ✅ duplicate হলেও বাদ যাবে না — যতবার আপলোড, ততবার স্টকে যোগ হবে
+        added = len(new_keys)
+        _cdkey_save_stock(pid, kid, cur)
+    _cdkey_done(uid, f"✅ <b>{added} টি key যোগ হয়েছে</b>\n📦 মোট স্টক: {len(cur)}",
+                _cdkey_admin_package_view(pid, kid))
+
 
 
 @bot.callback_query_handler(func=lambda call: (
@@ -20874,7 +21655,7 @@ def _text_message_worker(message):
             parse_mode="HTML", reply_markup=get_other_menu(user_id)); return
     elif text in (L.get("buy_proxy",""), LANG["en"].get("buy_proxy",""), LANG["bn"].get("buy_proxy","")):
         handle_buy_proxy(user_id, db); return
-    elif text in {kb_label(_r) for _r in ["proxy_real", "proxy_allvpn", "proxy_gb", "proxy_isp"]}:
+    elif text in {kb_label(_r) for _r in ["proxy_real", "proxy_allvpn", "proxy_gb", "proxy_isp", "proxy_cdkey"]}:
         handle_proxy_provider_selected(user_id, text, db); return
     elif text in (L.get("admin",""), LANG["en"]["admin"]) and is_admin(user_id):
         show_admin_panel(user_id); return
@@ -25749,7 +26530,7 @@ def _process_deposit_request_inner(message, user_id, method, account, amount, is
                 return
 
     # ══════════════════════════════════════════════════
-    # 🔵 BINANCE — Manual Admin Approval (আগের মতোই)
+    # ?? BINANCE — Manual Admin Approval (আগের মতোই)
     # ══════════════════════════════════════════════════
     request_id = f"DEP-{uuid.uuid4().hex[:6].upper()}"
     current_time = get_now()
@@ -26644,6 +27425,9 @@ def show_admin_panel(user_id):
     )
     markup.add(
         InlineBtn("🎥 Deposit Tutorial Link", style="primary", callback_data="admin_deposit_tutorial")
+    )
+    markup.add(
+        InlineBtn("🔑 CD Key Manager", style="primary", callback_data="admin_cdkey_manage")
     )
     markup.add(
         InlineBtn("🚫 Trx id block", style="danger", callback_data="admin_trx_block")
