@@ -8798,44 +8798,76 @@ def _gic_svc_fields(sv):
     code = sv.get("code") or sv.get("service_code") or sv.get("service") or sv.get("id")
     name = sv.get("name") or sv.get("service_name") or code
     price = None
-    for k in ("price", "min_price", "from_price", "cost"):
+    for k in ("price", "min_price", "price_from", "from_price", "cost"):
         price = _gic_num(sv.get(k))
         if price is not None:
             break
     return (str(code) if code is not None else None), str(name), price
 
 
-def _gic_find_price(obj, domain):
-    """/otp/services/mail/{service} রেসপন্স থেকে domain-এর দাম খোঁজে (আকৃতি বিভিন্ন হতে পারে)।
-    (price|None, domain_listed: True/False/None) রিটার্ন করে — None মানে রেসপন্সে domain লিস্টই নেই।"""
-    best = {"price": None, "listed": None, "any": None}
+_GIC_PRICE_KEYS = ("price", "min_price", "price_from", "cost", "price_usd", "amount")
+_GIC_STOCK_KEYS = ("stock", "stock_quantity", "stock_count", "available", "quantity", "count", "in_stock_count")
+
+
+def _gic_first_num(o, keys):
+    for k in keys:
+        if k in o and not isinstance(o[k], (bool, dict, list)):
+            v = _gic_num(o[k])
+            if v is not None:
+                return v
+    return None
+
+
+def _gic_find_option(obj, dk):
+    """/otp/services/mail/{service} রেসপন্সে ("every email provider") থেকে Gmail/iCloud অপশন খোঁজে।
+    ডকে রেসপন্সের আকৃতি দেওয়া নেই, তাই keyword ("gmail"/"icloud") মিলিয়ে যেকোনো nested আকৃতিতে খোঁজা হয়।
+    রিটার্ন: (domain, usd_price|None, stock|None, listed)
+      listed=True  → অপশন পাওয়া গেছে (এবং stock>0 / in_stock)
+      listed=False → provider লিস্ট আছে কিন্তু এই provider নেই / stock শেষ
+      listed=None  → রেসপন্সে provider লিস্ট চেনা যায়নি (বাই করে দেখা হবে)"""
+    domain, _label = GIC_DOMAINS[dk]
+    kw = domain.split(".")[0]
+    st = {"opt": None, "provider_list": False, "price": None}
 
     def walk(o):
         if isinstance(o, dict):
-            _dv = o.get("domain") or o.get("name")
-            dom = _dv if isinstance(_dv, str) else None
-            pr = None
-            for k in ("price", "min_price", "cost"):
-                pr = _gic_num(o.get(k))
-                if pr is not None:
-                    break
-            if dom and "." in dom:
-                best["listed"] = best["listed"] or False
-                if dom.lower() == domain:
-                    best["listed"] = True
-                    if pr is not None:
-                        best["price"] = pr
-            elif pr is not None and best["any"] is None:
-                best["any"] = pr
+            texts = [v for v in o.values() if isinstance(v, str)]
+            provider_like = any(isinstance(o.get(k), str) for k in ("domain", "email_domain", "provider", "name", "label", "title"))
+            pr = _gic_first_num(o, _GIC_PRICE_KEYS)
+            if provider_like:
+                st["provider_list"] = True
+            if provider_like and st["opt"] is None and any(kw in t.lower() for t in texts):
+                dom = None
+                for k in ("domain", "email_domain"):
+                    v = o.get(k)
+                    if isinstance(v, str) and "." in v and " " not in v:
+                        dom = v.strip().lower()
+                        break
+                stock = _gic_first_num(o, _GIC_STOCK_KEYS)
+                if o.get("in_stock") is False:
+                    stock = 0
+                st["opt"] = (dom or domain, pr, stock)
+            elif pr is not None and st["price"] is None:
+                st["price"] = pr
             for v in o.values():
                 walk(v)
         elif isinstance(o, list):
             for v in o:
                 walk(v)
-        elif isinstance(o, str) and "." in o and o.lower() == domain:
-            best["listed"] = True
+        elif isinstance(o, str):
+            t = o.strip().lower()
+            if kw in t and "." in t and " " not in t and st["opt"] is None:
+                st["opt"] = (t, None, None)
+                st["provider_list"] = True
     walk(obj)
-    return (best["price"] if best["price"] is not None else best["any"]), best["listed"]
+    if st["opt"]:
+        dom, pr, stock = st["opt"]
+        if stock is not None and stock <= 0:
+            return dom, pr if pr is not None else st["price"], stock, False
+        return dom, pr if pr is not None else st["price"], stock, True
+    if st["provider_list"]:
+        return domain, None, None, False
+    return domain, st["price"], None, None
 
 
 def _gic_bdt(usd):
@@ -9012,8 +9044,12 @@ def _gic_poll_worker(user_id, oid, chat_id):
             return
 
 
-def _gic_do_buy(call, dk, code):
-    uid = str(call.from_user.id)
+_gic_pending_buy = {}      # {user_id: (dk, service_code)} — Reply Keyboard "Buy one pice" এর জন্য
+
+
+def _gic_do_buy(uid, dk, code, chat_id=None):
+    uid = str(uid)
+    chat_id = chat_id or uid
     domain, label = GIC_DOMAINS[dk]
     if not BULKMAIL_API_KEY:
         bot.send_message(uid, "⚠️ সার্ভিস এখন বন্ধ আছে (API key সেট নেই)। Admin কে জানান।")
@@ -9023,9 +9059,11 @@ def _gic_do_buy(call, dk, code):
     if not det or det.get("success") is False:
         bot.send_message(uid, f"⚠️ সার্ভিসের তথ্য আনা যায়নি: {_gm_e(_gic_err(det, st))}", parse_mode="HTML")
         return
-    usd, listed = _gic_find_price(det.get("data", det), domain)
+    domain, usd, stock, listed = _gic_find_option(det.get("data", det), dk)
+    if listed is not True:
+        logging.warning(f"gic option check dk={dk} service={code} listed={listed} resp={str(det)[:800]}")
     if listed is False:
-        bot.send_message(uid, f"🚧 <b>{label}</b> ({_gm_e(domain)}) এই সার্ভিসের জন্য এখন পাওয়া যাচ্ছে না।", parse_mode="HTML")
+        bot.send_message(uid, f"🚧 <b>{label}</b> এই সার্ভিসের জন্য এখন পাওয়া যাচ্ছে না (স্টক নেই)।", parse_mode="HTML")
         return
     if usd is None:
         bot.send_message(uid, "⚠️ দাম পাওয়া যায়নি। একটু পরে আবার চেষ্টা করুন।")
@@ -9058,7 +9096,7 @@ def _gic_do_buy(call, dk, code):
         return
     bot.send_message(uid, _gic_order_text(od, f"✅ <b>{label} — কেনা সম্পূর্ণ</b>\n💰 {fmt_bdt_precise(price_bdt)}৳"),
                      parse_mode="HTML", reply_markup=_gic_order_markup(oid))
-    threading.Thread(target=_gic_poll_worker, args=(uid, oid, call.message.chat.id), daemon=True,
+    threading.Thread(target=_gic_poll_worker, args=(uid, oid, chat_id), daemon=True,
                      name=f"gic_poll_{oid}").start()
 
 
@@ -9099,25 +9137,35 @@ def cb_gmail_icloud(call):
             domain, label = GIC_DOMAINS[dk]
             det, st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/services/mail/{code}", headers=_gic_headers(),
                                     timeout=12, retries=1, tag="gic detail")
-            usd, listed = _gic_find_price((det or {}).get("data", det or {}), domain) if det else (None, None)
             if not det or det.get("success") is False:
                 bot.send_message(uid, f"⚠️ তথ্য আনা যায়নি: {_gm_e(_gic_err(det, st))}", parse_mode="HTML"); return
+            domain, usd, stock, listed = _gic_find_option(det.get("data", det), dk)
+            if listed is not True:
+                logging.warning(f"gic pick check dk={dk} service={code} listed={listed} resp={str(det)[:800]}")
             if listed is False:
-                bot.send_message(uid, f"🚧 <b>{label}</b> ({_gm_e(domain)}) এই সার্ভিসের জন্য এখন পাওয়া যাচ্ছে না।", parse_mode="HTML"); return
+                bot.send_message(uid, f"🚧 <b>{label}</b> এই সার্ভিসের জন্য এখন পাওয়া যাচ্ছে না (স্টক নেই)।", parse_mode="HTML"); return
             price_txt = f"{fmt_bdt_precise(_gic_bdt(usd))}৳" if usd is not None else "—"
-            mk = types.InlineKeyboardMarkup(row_width=2)
-            mk.row(InlineBtn("🛒 Buy 1pcs", style="success", callback_data=f"gic_buy|{dk}|{code}"[:64]),
-                   InlineBtn("🔙 Back", callback_data=f"gic_svc|{dk}|1"))
+            if stock is not None:
+                price_txt += f"  |  📦 {int(stock)} in stock"
+            # 🛒 অন্য প্রোডাক্টের মতোই: ডিটেইল মেসেজ + নিচে Reply Keyboard এ "Buy one pice" বাটন
+            _gic_pending_buy[uid] = (dk, code)
+            _pending_product_cache.pop(uid, None)
+            _pending_product_origin[uid] = "gic"
+            _L = LANG[get_user_lang(uid)]
+            kb = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+            kb.add(KbBtn(_L["single_buy"], role="buy_single"))
+            kb.add(KbBtn("Back", role="back"))
             bot.send_message(uid, f"{label} <b>({_gm_e(domain)})</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
                                   f"📦 সার্ভিস: <b>{_gm_e(code)}</b>\n💰 দাম: <b>{price_txt}</b>\n"
-                                  f"⏱️ মেয়াদ: ২০ মিনিট — কোড না এলে অটো refund।",
-                             parse_mode="HTML", reply_markup=mk)
+                                  f"⏱️ মেয়াদ: ২০ মিনিট — কোড না এলে অটো refund।\n\n"
+                                  f"👇 কিনতে নিচের <b>{_gm_e(_L['single_buy'])}</b> বাটন চাপুন।",
+                             parse_mode="HTML", reply_markup=kb)
         elif act == "gic_buy":
             try:
                 bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=None)   # double-click আটকাতে
             except Exception:
                 pass
-            _gic_do_buy(call, parts[1], parts[2])
+            _gic_do_buy(uid, parts[1], parts[2], call.message.chat.id)
         elif act in ("gic_chk", "gic_nxt", "gic_cnl"):
             oid = parts[1]
             if not _gic_find_order(uid, oid):
@@ -20055,6 +20103,10 @@ def _text_message_worker(message):
     lang = _lang_cache.get(user_id, "en")
     L = LANG[lang]
 
+    # 📬 Gmail & iCloud pending service — Buy বাটন ছাড়া অন্য কিছু চাপলে মুছে ফেলো
+    if str(user_id) in _gic_pending_buy and text not in (L.get("single_buy", ""), LANG["en"].get("single_buy", ""), LANG["bn"].get("single_buy", "")):
+        _gic_pending_buy.pop(str(user_id), None)
+
     # 🔒 buy মেনুর বাইরের যেকোনো বাটন/টেক্সট (Back সহ) → কেনা মেইলের data মুছো।
     # buy মেনুর নিজের বাটন (Single Buy / Bulk Buy / Get OTP) হলে মুছবে না।
     if str(user_id) in _last_delivered_account:
@@ -20121,8 +20173,8 @@ def _text_message_worker(message):
             _show_edu_mail_submenu(user_id, db_quick)
         elif last_origin == "buy_proxy":
             handle_buy_proxy(user_id, db_quick)
-        elif last_origin == "gmail":
-            show_shop_menu(user_id, db_quick)          # 📮 Gmail API সার্ভিস থেকে Back -> Product মেনুতে
+        elif last_origin in ("gmail", "gic"):
+            show_shop_menu(user_id, db_quick)          # 📮 Gmail API / 📬 Gmail & iCloud সার্ভিস থেকে Back -> Product মেনুতে
         else:
             show_shop_menu(user_id, db_quick)
         return
@@ -21122,6 +21174,9 @@ def show_product_detail_with_subnav(user_id, product_name, db=None, display_name
         bot.send_message(user_id, detail_msg, reply_markup=buy_markup, parse_mode="HTML")
 
 def handle_single_buy_from_keyboard(user_id, db):
+    _gp = _gic_pending_buy.get(str(user_id))
+    if _gp:                                     # 📬 Gmail & iCloud সার্ভিস (bulkmail OTP mail)
+        _gic_do_buy(user_id, _gp[0], _gp[1], user_id); return
     product_name = _pending_product_cache.get(user_id) or db["users"].get(user_id, {}).get("pending_product")
     is_api = product_name in API_PRODUCTS if product_name else False
     if not product_name or (not is_api and product_name not in db["products"]):
@@ -24403,7 +24458,7 @@ def _bc_ask_txid(message, kind, amount, attempts):
             msg = bot.send_message(user_id,
                 _bc_txt(user_id,
                     "⚠️ ID টি সঠিক ফরম্যাটে নয়। আবার পাঠান:👇" if kind == "pay" else "⚠️ TxID সঠিক নয় (0x… ৬৪ অক্ষরের হ্যাশ, অথবা Binance-to-Binance হলে Off-chain Transfer এর নম্বর)। আবার পাঠান:👇",
-                    "⚠️ Invalid ID format. Send it again:👇" if kind == "pay" else "⚠️ Invalid TxID (a 0x… 64-char hash, or the Off-chain Transfer number for Binance-to-Binance). Send it again:👇"),
+                    "⚠️ Invalid ID format. Send it again:??" if kind == "pay" else "⚠️ Invalid TxID (a 0x… 64-char hash, or the Off-chain Transfer number for Binance-to-Binance). Send it again:👇"),
                 parse_mode="HTML", reply_markup=get_cancel_button(user_id))
             bot.register_next_step_handler(msg, lambda m: _bc_ask_txid(m, kind, amount, attempts)); return
 
