@@ -3713,6 +3713,10 @@ EDU_MAIL_TERMS_EN = (
 # ─── Hotmail ও Outlook — standalone API products (no sub-menu) ───
 HOTMAIL_PROD  = "Hotmail"
 OUTLOOK_PROD  = "Outlook"
+# 🔐 Recovery added — Hotmail ও Outlook এর মতোই ফ্লো (Buy Mail → Hotmail & Outlook মেনুর ভিতরে ১ বাই ১ বাটন)
+RECOVERY_HOTMAIL_PROD = "Recovery added Hotmail"
+RECOVERY_OUTLOOK_PROD = "Recovery added Outlook"
+# ⚠️ এই ২টা প্রোডাক্টে কোনো API নেই — শুধু Local Stock (.xlsx আপলোড)।
 
 # ─── Product1 — placeholder shop button, ভবিতে ফিচার/প্রোডাক্ট এ্যাড হবে ───
 # Shop menu তে বাটন → ক্লিক করলে "select product items" মেসেজ + ১২টা inline
@@ -8408,6 +8412,9 @@ GMAIL_BTN_LABEL = "📮 Gmail API"   # Buy Mail শপ মেনুতে ইউ
 # 📬 Gmail & iCloud — Buy Mail শপ মেনুর নতুন বাটন (ভিতরে Gmail ও iCloud ২টা inline বাটন)
 GMAIL_ICLOUD_ORDER_KEY = "__gmail_icloud__"      # internal key (DB order/hide সেটিং এর জন্য — বদলাবেন না)
 GMAIL_ICLOUD_BTN_LABEL = "📬 Gmail & iCloud"     # Buy Mail শপ মেনুতে ইউজার যে নামে বাটনটা দেখে
+# 📨 Hotmail & Outlook — Buy Mail শপ মেনুর নতুন বাটন (ভিতরে Hotmail ও Outlook ২টা inline বাটন)
+HOTMAIL_OUTLOOK_ORDER_KEY = "__hotmail_outlook__"      # internal key (DB order/hide সেটিং এর জন্য — বদলাবেন না)
+HOTMAIL_OUTLOOK_BTN_LABEL = "📨 Hotmail & Outlook"     # Buy Mail শপ মেনুতে ইউজার যে নামে বাটনটা দেখে
 
 # platform_key -> প্রোডাক্ট (db["products"] এর নাম) + বাটনের নাম/emoji
 GMAIL_PLATFORMS = {
@@ -8837,6 +8844,34 @@ def _gic_svc_fields(sv):
     return (str(code) if code is not None else None), str(name), price
 
 
+_gic_oos = set()           # স্টক-শেষ সার্ভিসের code (সার্ভিস লিস্ট রেসপন্স থেকে) — বাটন 🔴 লাল দেখানোর জন্য
+
+
+def _gic_track_stock(sv, code):
+    """সার্ভিস লিস্টের একটা আইটেমে স্টক ০/শেষ দেখালে code কে _gic_oos এ রাখে, স্টক থাকলে সরায়।
+    স্টকের তথ্য না থাকলে কিছুই বদলায় না (বাটন নীলই থাকে)।"""
+    try:
+        stock = _gic_first_num(sv, _GIC_STOCK_KEYS)
+        out = None
+        if sv.get("in_stock") is False or sv.get("available") is False or sv.get("is_available") is False:
+            out = True
+        elif stock is not None:
+            out = stock <= 0
+        elif sv.get("in_stock") is True or sv.get("available") is True or sv.get("is_available") is True:
+            out = False
+        if out is True:
+            _gic_oos.add(code)
+        elif out is False:
+            _gic_oos.discard(code)
+    except Exception:
+        pass
+
+
+def _gic_svc_style(code):
+    """স্টক না থাকলে লাল (danger), নাহলে নীল (primary)।"""
+    return "danger" if code in _gic_oos else "primary"
+
+
 def _gic_detail_name(det, code):
     """সার্ভিসের পুরো নাম: ক্যাশ → /otp/services/mail/{code} রেসপন্স → (শেষে) code।"""
     if _gic_names.get(code):
@@ -9006,9 +9041,10 @@ def _gic_services_view(dk, page, uid):
         if not code:
             continue
         _gic_names[code] = name
+        _gic_track_stock(sv, code)
         ptxt = (lambda _pb: f" [{fmt_bdt_precise(_pb)}৳]" if _pb is not None else "")(_gic_price_bdt(price, dk, code))
         shown = name if len(name) <= 24 else name[:23] + "…"
-        btns.append(InlineBtn(f"{shown}{ptxt}", style="primary", callback_data=f"gic_pick|{dk}|{code}"[:64]))
+        btns.append(InlineBtn(f"{shown}{ptxt}", style=_gic_svc_style(code), callback_data=f"gic_pick|{dk}|{code}"[:64]))
     for i in range(0, len(btns), 2):
         markup.row(*btns[i:i + 2])
     nav = []
@@ -9052,6 +9088,7 @@ def _gic_all_services(max_pages=30):
             if code and code not in seen:
                 seen.add(code)
                 _gic_names[code] = name
+                _gic_track_stock(sv, code)
                 out.append((code, name, price))
         _dd = data.get("data")
         meta = data.get("meta") or (_dd.get("meta") if isinstance(_dd, dict) else None)
@@ -9082,7 +9119,7 @@ def _gic_svc_search_step(message, dk):
     for code, name, price in hits[:20]:
         ptxt = (lambda _pb: f" [{fmt_bdt_precise(_pb)}৳]" if _pb is not None else "")(_gic_price_bdt(price, dk, code))
         shown = name if len(name) <= 24 else name[:23] + "…"
-        btns.append(InlineBtn(f"{shown}{ptxt}", style="primary", callback_data=f"gic_pick|{dk}|{code}"[:64]))
+        btns.append(InlineBtn(f"{shown}{ptxt}", style=_gic_svc_style(code), callback_data=f"gic_pick|{dk}|{code}"[:64]))
     for i in range(0, len(btns), 2):
         m.row(*btns[i:i + 2])
     m.row(InlineBtn(_gic_t(uid, "🔍 Search Again", "🔍 আবার খুঁজুন"), style="primary", callback_data=f"gic_ssearch|{dk}"))
@@ -9419,8 +9456,11 @@ def cb_gmail_icloud(call):
             if listed is not True:
                 logging.warning(f"gic pick check dk={dk} service={code} listed={listed} resp={str(det)[:800]}")
             if listed is False:
+                _gic_oos.add(code)
                 bot.send_message(uid, f"🚧 <b>{label}</b> " + T("is not available for this service right now (out of stock).",
                                  "এই সার্ভিসের জন্য এখন পাওয়া যাচ্ছে না (স্টক নেই)।"), parse_mode="HTML"); return
+            if listed is True:
+                _gic_oos.discard(code)
             name = _gic_detail_name(det, code)
             _pb = _gic_price_bdt(usd, dk, code)
             price_txt = f"{fmt_bdt_precise(_pb)}৳" if _pb is not None else "—"
@@ -9761,6 +9801,64 @@ def cb_gmail_pick(call):
             show_product_detail_with_subnav(uid, pn, db, origin="gmail")
         except Exception as e:
             logging.error(f"cb_gmail_pick error: {e}\n{traceback.format_exc()}")
+    _EXECUTOR.submit(_run)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 📨 HOTMAIL & OUTLOOK — Buy Mail মেনুর একটা বাটন; ভিতরে Hotmail / Outlook INLINE বাটন।
+#   Hotmail বা Outlook বাটনে ক্লিক করলে আগের মতোই প্রোডাক্ট ডিটেইল + Buy ফ্লো চলে।
+# ───────────────────────────────────────────────────────────────────────────
+HO_ITEMS = {"hotmail": (HOTMAIL_PROD, "📧 Hotmail"), "outlook": (OUTLOOK_PROD, "📨 Outlook"),
+            "rhotmail": (RECOVERY_HOTMAIL_PROD, "🔐 Recovery added Hotmail"),
+            "routlook": (RECOVERY_OUTLOOK_PROD, "🔐 Recovery added Outlook")}
+
+
+def _show_hotmail_outlook_submenu(user_id, db=None):
+    """📨 Hotmail & Outlook বাটন চাপলে — ২টা INLINE বাটন (স্টক থাকলে 🟢, না থাকলে 🔴)।
+    নিচের Reply Keyboard বদলায় না — ইউজার Buy Mail মেনুতেই থাকে।"""
+    if db is None:
+        db = load_db()
+    user_id = str(user_id)
+    _pending_product_cache.pop(user_id, None)
+    _pending_product_origin.pop(user_id, None)
+    btns = {}
+    for key, (pn, label) in HO_ITEMS.items():
+        btns[key] = InlineBtn(label, style=_product_stock_style(pn, db),
+                              callback_data=f"ho_pick|{key}")
+    inline = types.InlineKeyboardMarkup(row_width=2)
+    inline.row(btns["hotmail"], btns["outlook"])     # উপরে Hotmail | Outlook
+    inline.row(btns["rhotmail"])                      # নিচে ১ বাই ১
+    inline.row(btns["routlook"])
+    bot.send_message(
+        user_id,
+        "📨 <b>Hotmail &amp; Outlook</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nকোন ধরনের মেইল কিনবেন?",
+        parse_mode="HTML", reply_markup=inline)
+
+
+@bot.callback_query_handler(func=lambda c: (c.data or "").startswith("ho_pick|"))
+def cb_hotmail_outlook_pick(call):
+    """📨 Hotmail & Outlook → inline বাটন ক্লিক → প্রোডাক্ট ডিটেইল (Buy ফ্লো আগের মতোই)"""
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    uid = str(call.from_user.id)
+    if _gm_banned(uid):
+        return
+    if not enforce_join_gate(uid, call):
+        return
+    key = call.data.split("|", 1)[1]
+    pn = HO_ITEMS.get(key, (None, None))[0]
+    if not pn:
+        return
+
+    def _run():
+        try:
+            db = load_db()
+            _pending_product_cache[uid] = pn
+            show_product_detail_with_subnav(uid, pn, db)
+        except Exception as e:
+            logging.error(f"cb_hotmail_outlook_pick error: {e}\n{traceback.format_exc()}")
     _EXECUTOR.submit(_run)
 
 
@@ -20780,6 +20878,9 @@ def _text_message_worker(message):
     # ── 📬 Gmail & iCloud বাটন → ভিতরে Gmail / iCloud inline বাটন ──
     elif text == GMAIL_ICLOUD_ORDER_KEY:
         _show_gmail_icloud_submenu(user_id, db); return
+    # ── 📨 Hotmail & Outlook বাটন → ভিতরে Hotmail / Outlook inline বাটন ──
+    elif text == HOTMAIL_OUTLOOK_ORDER_KEY:
+        _show_hotmail_outlook_submenu(user_id, db); return
     # ── 📮 Gmail parent button → প্ল্যাটফর্ম মেনু ──
     elif text == GMAIL_PARENT:
         _show_gmail_submenu(user_id, db); return
@@ -20925,6 +21026,7 @@ def _shop_button_only_display_map(db=None):
         EDU_MAIL_PARENT: "📧 Edu Mail",
         GMAIL_PARENT: GMAIL_BTN_LABEL,
         GMAIL_ICLOUD_ORDER_KEY: GMAIL_ICLOUD_BTN_LABEL,
+        HOTMAIL_OUTLOOK_ORDER_KEY: HOTMAIL_OUTLOOK_BTN_LABEL,
         PRODUCT1_ORDER_KEY: f"🅰️ {get_product1_btn_label(db)}",
         PRODUCT2_ORDER_KEY: f"🅱️ {get_product2_btn_label(db)}",
         PRODUCT3BULK_ORDER_KEY: f"🅲️ {get_product3bulk_btn_label(db)}",
@@ -20939,6 +21041,15 @@ def _shop_raw_item_keys(db=None):
     _hidden_sub = {EDU_MAIL_SUB_24H, EDU_MAIL_SUB_72H, EDU_MAIL_SUB_24HR, EDU_MAIL_PARENT}
     db_product_keys = set(db["products"].keys())
     products = [p for p in db["products"].keys() if p not in _hidden_sub and not _is_edu_mail_virtual_product(p) and not _is_vpn_category_product(p) and not _is_product1_sub_product(p) and not _is_product2_sub_product(p) and not _is_product3bulk_sub_product(p) and not _is_proxy_provider_product(p) and not _gm_is_product(p)]
+    # 📨 Hotmail ও Outlook আলাদা বাটন না — একটা "Hotmail & Outlook" বাটন (প্রথমটার জায়গায়)
+    _ho_all = (HOTMAIL_PROD, OUTLOOK_PROD, RECOVERY_HOTMAIL_PROD, RECOVERY_OUTLOOK_PROD)
+    _ho_present = [p for p in products if p in _ho_all]
+    if not _ho_present:
+        _ho_present = [HOTMAIL_PROD]; products = list(products) + [HOTMAIL_PROD]   # কোনোটা DB তে না থাকলেও বাটন থাকবে
+    if _ho_present:
+        _ho_idx = products.index(_ho_present[0])
+        products = [p for p in products if p not in _ho_all]
+        products.insert(_ho_idx, HOTMAIL_OUTLOOK_ORDER_KEY)
     _bulkmail_edu_enabled = is_bulkmail_enabled(EDU_MAIL_SUB_24HR, db)
     _h143_24h_enabled     = is_hotmail143_enabled(EDU_MAIL_SUB_24H, db) and EDU_MAIL_SUB_24H in db_product_keys
     _h143_72h_enabled     = is_hotmail143_enabled(EDU_MAIL_SUB_72H, db) and EDU_MAIL_SUB_72H in db_product_keys
@@ -21048,6 +21159,8 @@ def _shop_label_to_key(text, db=None):
         return GMAIL_PARENT
     if text == GMAIL_ICLOUD_BTN_LABEL:
         return GMAIL_ICLOUD_ORDER_KEY
+    if text == HOTMAIL_OUTLOOK_BTN_LABEL:
+        return HOTMAIL_OUTLOOK_ORDER_KEY
     return text
 
 def _shop_item_display_label(item_key, db=None):
@@ -21065,6 +21178,8 @@ def _shop_item_display_label(item_key, db=None):
         return _shop_btn_labels(db).get(item_key) or GMAIL_BTN_LABEL
     if item_key == GMAIL_ICLOUD_ORDER_KEY:
         return _shop_btn_labels(db).get(item_key) or GMAIL_ICLOUD_BTN_LABEL
+    if item_key == HOTMAIL_OUTLOOK_ORDER_KEY:
+        return _shop_btn_labels(db).get(item_key) or HOTMAIL_OUTLOOK_BTN_LABEL
     return _shop_btn_labels(db).get(item_key) or item_key
 
 def _shop_item_role(item_key):
@@ -28942,7 +29057,7 @@ def _callback_worker_impl(call):
             bot.answer_callback_query(call.id, "❌ No products!", show_alert=True); return
         _admin_sessions["del_product_list"] = {}
         markup = types.InlineKeyboardMarkup(row_width=1)
-        special_keys = {EDU_MAIL_PARENT, GMAIL_PARENT, GMAIL_ICLOUD_ORDER_KEY, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY}
+        special_keys = {EDU_MAIL_PARENT, GMAIL_PARENT, GMAIL_ICLOUD_ORDER_KEY, HOTMAIL_OUTLOOK_ORDER_KEY, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY}
         for idx, key in enumerate(shop_keys):
             label_name = _shop_item_display_label(key, db)
             if key in special_keys:
@@ -29580,7 +29695,10 @@ def _callback_worker_impl(call):
     elif callback_data == "admin_edit_price":
         # ✅ শুধু Buy মেনুতে (শপ মেনুতে) যেই প্রোডাক্ট বাটনগুলো দেখা যায় সেগুলোর price এখানে edit হবে
         # (Edu Mail / Product1 / Product2 / Product3Bulk এর নিজস্ব Manager এ আলাদা 💰 Price বাটন আছে)
-        products = [k for k in _shop_default_item_keys(db) if k in db.get("products", {})]
+        _sd_keys = _shop_default_item_keys(db)
+        products = [k for k in _sd_keys if k in db.get("products", {})]
+        if HOTMAIL_OUTLOOK_ORDER_KEY in _sd_keys:
+            products += [k for k in (HOTMAIL_PROD, OUTLOOK_PROD, RECOVERY_HOTMAIL_PROD, RECOVERY_OUTLOOK_PROD) if k in db.get("products", {}) and k not in products]
         if not products and GMAIL_PARENT not in _shop_default_item_keys(db):
             bot.answer_callback_query(call.id, "❌ No products!", show_alert=True); return
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -36913,6 +37031,8 @@ def auto_init_sub_products():
             EDU_MAIL_SUB_24HR: 50,   # Bulkmail product — ডিফল্ট price
             HOTMAIL_PROD:      30,   # ডিফল্ট price — admin পরে change করতে পারবে
             OUTLOOK_PROD:      30,   # ডিফল্ট price — admin পরে change করতে পারবে
+            RECOVERY_HOTMAIL_PROD: 30,  # ডিফল্ট price — admin পরে change করতে পারবে
+            RECOVERY_OUTLOOK_PROD: 30,  # ডিফল্ট price — admin পরে change করতে পারবে
         }
         for api_prod, default_price in EDU_MAIL_DEFAULT_PRICES.items():
             if api_prod not in db["products"]:
@@ -36927,7 +37047,7 @@ def auto_init_sub_products():
                     print(f"✅ Fixed zero price for API product: {api_prod} = {default_price} BDT")
 
         # Hotmail ও Outlook — API product, DB তে না থাকলে add করো
-        for _api_p in [HOTMAIL_PROD, OUTLOOK_PROD, EDU_MAIL_SUB_24HR]:
+        for _api_p in [HOTMAIL_PROD, OUTLOOK_PROD, RECOVERY_HOTMAIL_PROD, RECOVERY_OUTLOOK_PROD, EDU_MAIL_SUB_24HR]:
             if _api_p not in db["products"]:
                 _def_price = EDU_MAIL_DEFAULT_PRICES.get(_api_p, 30)
                 db["products"][_api_p] = _def_price
