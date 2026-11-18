@@ -8405,6 +8405,9 @@ from datetime import timezone as _gm_timezone
 
 GMAIL_PARENT = "📮 Gmail"          # internal key (DB order/hide সেটিং এর জন্য — বদলাবেন না)
 GMAIL_BTN_LABEL = "📮 Gmail API"   # Buy Mail শপ মেনুতে ইউজার যে নামে বাটনটা দেখে
+# 📬 Gmail & iCloud — Buy Mail শপ মেনুর নতুন বাটন (ভিতরে Gmail ও iCloud ২টা inline বাটন)
+GMAIL_ICLOUD_ORDER_KEY = "__gmail_icloud__"      # internal key (DB order/hide সেটিং এর জন্য — বদলাবেন না)
+GMAIL_ICLOUD_BTN_LABEL = "📬 Gmail & iCloud"     # Buy Mail শপ মেনুতে ইউজার যে নামে বাটনটা দেখে
 
 # platform_key -> প্রোডাক্ট (db["products"] এর নাম) + বাটনের নাম/emoji
 GMAIL_PLATFORMS = {
@@ -8716,6 +8719,441 @@ def _show_gmail_submenu(user_id, db=None):
         user_id,
         "📮 <b>Gmail API</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nকোন সার্ভিসের জন্য মেইল কিনবেন?",
         parse_mode="HTML", reply_markup=inline)
+
+
+def _show_gmail_icloud_submenu(user_id, db=None):
+    """📬 Gmail & iCloud বাটন চাপলে — ভিতরে ২টা INLINE বাটন: 📮 Gmail ও ☁️ iCloud।
+    নিচের Reply Keyboard বদলায় না — ইউজার Product মেনুতেই থাকে।"""
+    user_id = str(user_id)
+    _pending_product_cache.pop(user_id, None)
+    _pending_product_origin.pop(user_id, None)
+    inline = types.InlineKeyboardMarkup(row_width=2)
+    inline.row(
+        InlineBtn("📮 Gmail", style="primary", callback_data="gic_gmail"),
+        InlineBtn("☁️ iCloud", style="primary", callback_data="gic_icloud"),
+    )
+    bot.send_message(
+        user_id,
+        "📬 <b>Gmail &amp; iCloud</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nকোন ধরনের মেইল কিনবেন?",
+        parse_mode="HTML", reply_markup=inline)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 📬 GMAIL & ICLOUD — bulkmail.shop OTP Mail API (v2-docs: /otp/*, kind=mail)
+#   Flow: Gmail / iCloud বাটন → সার্ভিস লিস্ট (GET /otp/services?kind=mail) → সার্ভিস বাছাই
+#         → দাম + Buy কনফার্ম → POST /otp/buy {kind:mail, service, domain} → ইউজার মেইল পায়
+#         → GET /otp/orders/{id} পোল করে কোড পাঠায়; কোড না এলে (is_open=false) অটো refund।
+#   ENV: BULKMAIL_API_KEY (আগের মতোই), GIC_MARKUP_PERCENT (ডিফল্ট 0 — API দামের উপর লাভের %)
+# ───────────────────────────────────────────────────────────────────────────
+GIC_DOMAINS = {"g": ("gmail.com", "📮 Gmail"), "i": ("icloud.com", "☁️ iCloud")}
+GIC_PAGE_SIZE = 10
+try:
+    GIC_MARKUP_PERCENT = float(os.environ.get("GIC_MARKUP_PERCENT", "0") or 0)
+except ValueError:
+    GIC_MARKUP_PERCENT = 0.0
+
+
+def _gic_headers():
+    h = {"Accept": "application/json"}
+    if BULKMAIL_API_KEY:
+        h["X-API-Key"] = BULKMAIL_API_KEY
+    return h
+
+
+def _gic_post(path, payload=None, timeout=20):
+    """POST → (json_dict|None, http_status|None)। নেটওয়ার্ক এরর হলে (None, None)।"""
+    try:
+        r = _API_SESSION.post(f"{BULKMAIL_BASE_URL}{path}", json=payload or {}, headers=_gic_headers(), timeout=timeout)
+        try:
+            d = r.json()
+        except ValueError:
+            d = None
+        return (d if isinstance(d, dict) else None), r.status_code
+    except Exception as e:
+        logging.warning(f"gic POST {path} error: {type(e).__name__}: {e}")
+        return None, None
+
+
+def _gic_list_items(data):
+    if not isinstance(data, dict):
+        return []
+    d = data.get("data", data)
+    if isinstance(d, list):
+        return d
+    if isinstance(d, dict):
+        for k in ("services", "items", "results", "data"):
+            if isinstance(d.get(k), list):
+                return d[k]
+    return []
+
+
+def _gic_num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gic_svc_fields(sv):
+    code = sv.get("code") or sv.get("service_code") or sv.get("service") or sv.get("id")
+    name = sv.get("name") or sv.get("service_name") or code
+    price = None
+    for k in ("price", "min_price", "from_price", "cost"):
+        price = _gic_num(sv.get(k))
+        if price is not None:
+            break
+    return (str(code) if code is not None else None), str(name), price
+
+
+def _gic_find_price(obj, domain):
+    """/otp/services/mail/{service} রেসপন্স থেকে domain-এর দাম খোঁজে (আকৃতি বিভিন্ন হতে পারে)।
+    (price|None, domain_listed: True/False/None) রিটার্ন করে — None মানে রেসপন্সে domain লিস্টই নেই।"""
+    best = {"price": None, "listed": None, "any": None}
+
+    def walk(o):
+        if isinstance(o, dict):
+            _dv = o.get("domain") or o.get("name")
+            dom = _dv if isinstance(_dv, str) else None
+            pr = None
+            for k in ("price", "min_price", "cost"):
+                pr = _gic_num(o.get(k))
+                if pr is not None:
+                    break
+            if dom and "." in dom:
+                best["listed"] = best["listed"] or False
+                if dom.lower() == domain:
+                    best["listed"] = True
+                    if pr is not None:
+                        best["price"] = pr
+            elif pr is not None and best["any"] is None:
+                best["any"] = pr
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+        elif isinstance(o, str) and "." in o and o.lower() == domain:
+            best["listed"] = True
+    walk(obj)
+    return (best["price"] if best["price"] is not None else best["any"]), best["listed"]
+
+
+def _gic_bdt(usd):
+    return round(float(usd) * float(get_usd_bdt_rate()) * (1 + GIC_MARKUP_PERCENT / 100.0), 2)
+
+
+def _gic_err(data, status):
+    if isinstance(data, dict):
+        return str(data.get("error") or data.get("message") or f"HTTP {status}")
+    return f"HTTP {status}" if status else "API সংযোগ সমস্যা"
+
+
+def _gic_services_view(dk, page):
+    """সার্ভিস লিস্টের (text, markup) — ২ কলামে inline বাটন + Prev/Next।"""
+    domain, label = GIC_DOMAINS[dk]
+    data, st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/services",
+                             params={"kind": "mail", "page": page, "per_page": GIC_PAGE_SIZE},
+                             headers=_gic_headers(), timeout=12, retries=1, tag="gic services")
+    if not data or data.get("success") is False:
+        return f"⚠️ <b>{label}</b>\n\nসার্ভিস লিস্ট আনা যায়নি: {_gm_e(_gic_err(data, st))}", None
+    items = _gic_list_items(data)
+    _dd = data.get("data")
+    meta = data.get("meta") or (_dd.get("meta") if isinstance(_dd, dict) else None)
+    total_pages = 1
+    if isinstance(meta, dict):
+        try:
+            total_pages = max(1, int(meta.get("total_pages") or 1))
+        except (TypeError, ValueError):
+            total_pages = 1
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    btns = []
+    for sv in items:
+        if not isinstance(sv, dict):
+            continue
+        code, name, price = _gic_svc_fields(sv)
+        if not code:
+            continue
+        btns.append(InlineBtn(f"📦 {name}"[:40], style="primary", callback_data=f"gic_pick|{dk}|{code}"[:64]))
+    for i in range(0, len(btns), 2):
+        markup.row(*btns[i:i + 2])
+    nav = []
+    if page > 1:
+        nav.append(InlineBtn("⬅️ Prev", callback_data=f"gic_svc|{dk}|{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineBtn("Next ➡️", callback_data=f"gic_svc|{dk}|{page + 1}"))
+    if nav:
+        markup.row(*nav)
+    markup.row(InlineBtn("🔙 Back", callback_data="gic_home"))
+    if not btns:
+        return f"{label}\n\n🚧 এই মুহূর্তে কোনো সার্ভিস পাওয়া যায়নি।", markup
+    text = (f"{label} <b>({_gm_e(domain)})</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\nকোন সার্ভিসের জন্য মেইল কিনবেন?"
+            + (f"\nPage {page}/{total_pages}" if total_pages > 1 else ""))
+    return text, markup
+
+
+def _gic_order_markup(oid, show_next=True, show_cancel=True):
+    m = types.InlineKeyboardMarkup(row_width=2)
+    row = [InlineBtn("🔄 Check Code", style="primary", callback_data=f"gic_chk|{oid}")]
+    if show_next:
+        row.append(InlineBtn("➡️ Next Code", callback_data=f"gic_nxt|{oid}"))
+    m.row(*row)
+    if show_cancel:
+        m.row(InlineBtn("❌ Cancel & Refund", style="danger", callback_data=f"gic_cnl|{oid}"))
+    return m
+
+
+def _gic_find_order(user_id, oid):
+    db = load_db()
+    u = db["users"].get(str(user_id)) or {}
+    for o in _normalize_orders_list(u.get("orders", [])):
+        if isinstance(o, dict) and str(o.get("gic_id")) == str(oid):
+            return o
+    return None
+
+
+def _gic_charge(user_id, amount, entry):
+    """ব্যালেন্স কেটে অর্ডার সেভ (atomic, user-lock)। সফল হলে True, ব্যালেন্স কম হলে False।"""
+    user_id = str(user_id)
+    with get_user_lock(user_id):
+        db = load_db()
+        u = db["users"].get(user_id)
+        if not u or float(u.get("balance", 0)) < amount:
+            return False
+        u["balance"] = round(float(u.get("balance", 0)) - amount, 2)
+        orders = _normalize_orders_list(u.get("orders", []))
+        orders.append(entry)
+        u["orders"] = orders
+        update_db_path(f"/users/{user_id}", u, _async=False)
+        _update_db_cache_in_place(db)
+    return True
+
+
+def _gic_refund(user_id, oid, reason=""):
+    """একবারই refund (idempotent — অর্ডারের status 'refunded' হয়ে যায়)। True = এইবার refund হলো।"""
+    user_id = str(user_id)
+    try:
+        with get_user_lock(user_id):
+            db = load_db()
+            u = db["users"].get(user_id)
+            if not u:
+                return False
+            orders = _normalize_orders_list(u.get("orders", []))
+            for o in orders:
+                if isinstance(o, dict) and str(o.get("gic_id")) == str(oid):
+                    if o.get("status") == "refunded":
+                        return False
+                    amt = float(o.get("total", 0))
+                    u["balance"] = round(float(u.get("balance", 0)) + amt, 2)
+                    o["status"] = "refunded"
+                    o["refunded_amount"] = amt
+                    u["orders"] = orders
+                    update_db_path(f"/users/{user_id}", u, _async=False)
+                    _update_db_cache_in_place(db)
+                    log_action("GIC_REFUND", user_id, f"order={oid} amount={amt} reason={reason}")
+                    return True
+    except Exception as e:
+        logging.error(f"gic refund FAILED user={user_id} oid={oid}: {e}\n{traceback.format_exc()}")
+    return False
+
+
+def _gic_order_text(od, header=""):
+    email_addr = od.get("email") or od.get("phone_number") or "—"
+    code = od.get("code")
+    lines = [header or "📬 <b>Mail Order</b>", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+             f"📧 <code>{_gm_e(email_addr)}</code>"]
+    if code:
+        lines.append(f"🔑 Code: <code>{_gm_e(code)}</code>")
+        extra = [c.get("code") for c in (od.get("codes") or []) if isinstance(c, dict) and c.get("code") and c.get("code") != code]
+        if extra:
+            lines.append("🕘 আগের কোড: " + ", ".join(f"<code>{_gm_e(c)}</code>" for c in extra[:5]))
+    else:
+        lines.append("⏳ কোডের জন্য অপেক্ষা করা হচ্ছে… (মেইলে ভেরিফিকেশন পাঠান)")
+    return "\n".join(lines)
+
+
+def _gic_fetch_order(oid):
+    data, st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/orders/{oid}", headers=_gic_headers(),
+                             timeout=12, retries=1, tag=f"gic order {oid}")
+    if not data or data.get("success") is False:
+        return None, _gic_err(data, st)
+    d = data.get("data", data)
+    od = d.get("order", d) if isinstance(d, dict) else None
+    return (od if isinstance(od, dict) else None), ""
+
+
+def _gic_poll_worker(user_id, oid, chat_id):
+    """কোড আসা পর্যন্ত (সর্বোচ্চ ~21 মিনিট) পোল করে। কোড এলে পাঠায়; কোড ছাড়া অর্ডার বন্ধ হলে auto refund।"""
+    import time as _t
+    deadline = _t.time() + 21 * 60
+    wait = 5
+    while _t.time() < deadline:
+        _t.sleep(max(5, min(wait, 15)))
+        od, _err = _gic_fetch_order(oid)
+        if not od:
+            continue
+        try:
+            wait = int(od.get("poll_after_seconds") or 5)
+        except (TypeError, ValueError):
+            wait = 5
+        if od.get("code"):
+            try:
+                bot.send_message(chat_id, _gic_order_text(od, "✅ <b>Code পাওয়া গেছে!</b>"),
+                                 parse_mode="HTML", reply_markup=_gic_order_markup(oid, show_cancel=False))
+            except Exception as e:
+                logging.error(f"gic code send error: {e}")
+            return
+        if not od.get("is_open", True):
+            if _gic_refund(user_id, oid, "no code / expired"):
+                try:
+                    bot.send_message(chat_id, "⌛ <b>কোনো কোড আসেনি — অর্ডার শেষ।</b>\n💸 আপনার টাকা ফেরত দেওয়া হয়েছে।",
+                                     parse_mode="HTML")
+                except Exception:
+                    pass
+            return
+
+
+def _gic_do_buy(call, dk, code):
+    uid = str(call.from_user.id)
+    domain, label = GIC_DOMAINS[dk]
+    if not BULKMAIL_API_KEY:
+        bot.send_message(uid, "⚠️ সার্ভিস এখন বন্ধ আছে (API key সেট নেই)। Admin কে জানান।")
+        return
+    det, st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/services/mail/{code}", headers=_gic_headers(),
+                            timeout=12, retries=1, tag="gic service detail")
+    if not det or det.get("success") is False:
+        bot.send_message(uid, f"⚠️ সার্ভিসের তথ্য আনা যায়নি: {_gm_e(_gic_err(det, st))}", parse_mode="HTML")
+        return
+    usd, listed = _gic_find_price(det.get("data", det), domain)
+    if listed is False:
+        bot.send_message(uid, f"🚧 <b>{label}</b> ({_gm_e(domain)}) এই সার্ভিসের জন্য এখন পাওয়া যাচ্ছে না।", parse_mode="HTML")
+        return
+    if usd is None:
+        bot.send_message(uid, "⚠️ দাম পাওয়া যায়নি। একটু পরে আবার চেষ্টা করুন।")
+        return
+    price_bdt = _gic_bdt(usd)
+    db = load_db()
+    if float(db["users"].get(uid, {}).get("balance", 0)) < price_bdt:
+        bot.send_message(uid, f"❌ <b>ব্যালেন্স কম!</b>\n\nদাম: <b>{fmt_bdt_precise(price_bdt)}৳</b>\nআগে ডিপোজিট করুন।", parse_mode="HTML")
+        return
+    res, st2 = _gic_post("/otp/buy", {"kind": "mail", "service": code, "domain": domain})
+    if not res or res.get("success") is False:
+        msgs = {402: "সাপ্লায়ারের ব্যালেন্স শেষ — Admin কে জানান।", 404: "এই ডোমেইন এখন নেই।", 409: "স্টক শেষ / অপশন বদলে গেছে।"}
+        bot.send_message(uid, f"❌ <b>কেনা যায়নি:</b> {_gm_e(msgs.get(st2) or _gic_err(res, st2))}\n(আপনার টাকা কাটা হয়নি)", parse_mode="HTML")
+        return
+    d = res.get("data", res)
+    od = d.get("order", d) if isinstance(d, dict) else {}
+    oid = od.get("id")
+    if oid is None:
+        bot.send_message(uid, "⚠️ অর্ডার আইডি পাওয়া যায়নি, Admin কে জানান।")
+        logging.error(f"gic buy: no order id in {res}")
+        return
+    entry = {"id": f"GIC{oid}", "gic_id": oid, "product_name": f"{label} · {od.get('service_name') or code}",
+             "quantity": 1, "price_per_unit": price_bdt, "total": price_bdt,
+             "date": _time_module.strftime("%Y-%m-%d %H:%M:%S"), "status": "completed", "source": "gmail_icloud",
+             "email": od.get("email")}
+    if not _gic_charge(uid, price_bdt, entry):
+        # ইউজারের ব্যালেন্স এর মধ্যে কমে গেছে → সাপ্লায়ার অর্ডার ক্যানসেল (refund সাপ্লায়ার পাশে)
+        _gic_post(f"/otp/orders/{oid}/cancel")
+        bot.send_message(uid, "❌ ব্যালেন্স কম — অর্ডার বাতিল হয়েছে।")
+        return
+    bot.send_message(uid, _gic_order_text(od, f"✅ <b>{label} — কেনা সম্পূর্ণ</b>\n💰 {fmt_bdt_precise(price_bdt)}৳"),
+                     parse_mode="HTML", reply_markup=_gic_order_markup(oid))
+    threading.Thread(target=_gic_poll_worker, args=(uid, oid, call.message.chat.id), daemon=True,
+                     name=f"gic_poll_{oid}").start()
+
+
+@bot.callback_query_handler(func=lambda c: (c.data or "").startswith("gic_"))
+def cb_gmail_icloud(call):
+    """📬 Gmail & iCloud — সব inline বাটন (home / সার্ভিস লিস্ট / pick / buy / check / next / cancel)"""
+    uid = str(call.from_user.id)
+    data = call.data
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    if _gm_banned(uid) or not enforce_join_gate(uid, call):
+        return
+    try:
+        parts = data.split("|")
+        act = parts[0]
+        if act == "gic_icloud_old":
+            return
+        if act in ("gic_gmail", "gic_icloud"):
+            dk = "g" if act == "gic_gmail" else "i"
+            text, markup = _gic_services_view(dk, 1)
+            bot.send_message(uid, text, parse_mode="HTML", reply_markup=markup)
+        elif act == "gic_home":
+            try:
+                bot.delete_message(uid, call.message.message_id)
+            except Exception:
+                pass
+            _show_gmail_icloud_submenu(uid)
+        elif act == "gic_svc":
+            text, markup = _gic_services_view(parts[1], int(parts[2]))
+            try:
+                bot.edit_message_text(text, uid, call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            except Exception:
+                bot.send_message(uid, text, parse_mode="HTML", reply_markup=markup)
+        elif act == "gic_pick":
+            dk, code = parts[1], parts[2]
+            domain, label = GIC_DOMAINS[dk]
+            det, st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/services/mail/{code}", headers=_gic_headers(),
+                                    timeout=12, retries=1, tag="gic detail")
+            usd, listed = _gic_find_price((det or {}).get("data", det or {}), domain) if det else (None, None)
+            if not det or det.get("success") is False:
+                bot.send_message(uid, f"⚠️ তথ্য আনা যায়নি: {_gm_e(_gic_err(det, st))}", parse_mode="HTML"); return
+            if listed is False:
+                bot.send_message(uid, f"🚧 <b>{label}</b> ({_gm_e(domain)}) এই সার্ভিসের জন্য এখন পাওয়া যাচ্ছে না।", parse_mode="HTML"); return
+            price_txt = f"{fmt_bdt_precise(_gic_bdt(usd))}৳" if usd is not None else "—"
+            mk = types.InlineKeyboardMarkup(row_width=2)
+            mk.row(InlineBtn("🛒 Buy 1pcs", style="success", callback_data=f"gic_buy|{dk}|{code}"[:64]),
+                   InlineBtn("🔙 Back", callback_data=f"gic_svc|{dk}|1"))
+            bot.send_message(uid, f"{label} <b>({_gm_e(domain)})</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                                  f"📦 সার্ভিস: <b>{_gm_e(code)}</b>\n💰 দাম: <b>{price_txt}</b>\n"
+                                  f"⏱️ মেয়াদ: ২০ মিনিট — কোড না এলে অটো refund।",
+                             parse_mode="HTML", reply_markup=mk)
+        elif act == "gic_buy":
+            try:
+                bot.edit_message_reply_markup(uid, call.message.message_id, reply_markup=None)   # double-click আটকাতে
+            except Exception:
+                pass
+            _gic_do_buy(call, parts[1], parts[2])
+        elif act in ("gic_chk", "gic_nxt", "gic_cnl"):
+            oid = parts[1]
+            if not _gic_find_order(uid, oid):
+                bot.send_message(uid, "❌ অর্ডার পাওয়া যায়নি।"); return
+            if act == "gic_nxt":
+                res, st = _gic_post(f"/otp/orders/{oid}/next-code")
+                if not res or res.get("success") is False:
+                    bot.send_message(uid, f"⚠️ {_gm_e(_gic_err(res, st))}", parse_mode="HTML"); return
+                bot.send_message(uid, "➡️ পরের কোডের জন্য অপেক্ষা… একটু পরে 🔄 Check Code চাপুন।")
+                threading.Thread(target=_gic_poll_worker, args=(uid, oid, call.message.chat.id), daemon=True).start()
+            elif act == "gic_cnl":
+                res, st = _gic_post(f"/otp/orders/{oid}/cancel")
+                if not res or res.get("success") is False:
+                    bot.send_message(uid, f"⚠️ ক্যানসেল হয়নি: {_gm_e(_gic_err(res, st))}\n(২ মিনিটের আগে বা কোড আসার পরে ক্যানসেল হয় না)", parse_mode="HTML"); return
+                if _gic_refund(uid, oid, "user cancel"):
+                    bot.send_message(uid, "✅ অর্ডার বাতিল — 💸 টাকা ফেরত দেওয়া হয়েছে।")
+            else:
+                od, err = _gic_fetch_order(oid)
+                if not od:
+                    bot.send_message(uid, f"⚠️ {_gm_e(err)}", parse_mode="HTML"); return
+                if od.get("code"):
+                    bot.send_message(uid, _gic_order_text(od, "✅ <b>Code</b>"), parse_mode="HTML",
+                                     reply_markup=_gic_order_markup(oid, show_cancel=False))
+                elif not od.get("is_open", True):
+                    if _gic_refund(uid, oid, "closed without code"):
+                        bot.send_message(uid, "⌛ কোনো কোড আসেনি — 💸 টাকা ফেরত দেওয়া হয়েছে।")
+                    else:
+                        bot.send_message(uid, "⌛ অর্ডার শেষ হয়েছে।")
+                else:
+                    bot.send_message(uid, _gic_order_text(od), parse_mode="HTML", reply_markup=_gic_order_markup(oid))
+    except Exception as e:
+        logging.error(f"gic callback error ({data}): {e}\n{traceback.format_exc()}")
+        try:
+            bot.send_message(uid, "⚠️ কিছু একটা সমস্যা হয়েছে, আবার চেষ্টা করুন।")
+        except Exception:
+            pass
 
 
 @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("gm_pick|"))
@@ -19734,6 +20172,9 @@ def _text_message_worker(message):
         handle_proxy_provider_selected(user_id, text, db); return
     elif text in (L.get("admin",""), LANG["en"]["admin"]) and is_admin(user_id):
         show_admin_panel(user_id); return
+    # ── 📬 Gmail & iCloud বাটন → ভিতরে Gmail / iCloud inline বাটন ──
+    elif text == GMAIL_ICLOUD_ORDER_KEY:
+        _show_gmail_icloud_submenu(user_id, db); return
     # ── 📮 Gmail parent button → প্ল্যাটফর্ম মেনু ──
     elif text == GMAIL_PARENT:
         _show_gmail_submenu(user_id, db); return
@@ -19878,6 +20319,7 @@ def _shop_button_only_display_map(db=None):
     return {
         EDU_MAIL_PARENT: "📧 Edu Mail",
         GMAIL_PARENT: GMAIL_BTN_LABEL,
+        GMAIL_ICLOUD_ORDER_KEY: GMAIL_ICLOUD_BTN_LABEL,
         PRODUCT1_ORDER_KEY: f"🅰️ {get_product1_btn_label(db)}",
         PRODUCT2_ORDER_KEY: f"🅱️ {get_product2_btn_label(db)}",
         PRODUCT3BULK_ORDER_KEY: f"🅲️ {get_product3bulk_btn_label(db)}",
@@ -19901,7 +20343,7 @@ def _shop_raw_item_keys(db=None):
         products = [GMAIL_PARENT] + products
     if show_edu_mail_btn:
         products = [EDU_MAIL_PARENT] + products  # প্রথমে Edu Mail
-    return products + [PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY]
+    return products + [GMAIL_ICLOUD_ORDER_KEY, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY]
 
 def _shop_default_item_keys(db=None):
     """বর্তমানে Buy Mail শপ মেনুতে যেই আইটেমগুলো দেখানো হবে, তাদের key —
@@ -19999,6 +20441,8 @@ def _shop_label_to_key(text, db=None):
         pass
     if text == GMAIL_BTN_LABEL:
         return GMAIL_PARENT
+    if text == GMAIL_ICLOUD_BTN_LABEL:
+        return GMAIL_ICLOUD_ORDER_KEY
     return text
 
 def _shop_item_display_label(item_key, db=None):
@@ -20014,6 +20458,8 @@ def _shop_item_display_label(item_key, db=None):
         return get_product3bulk_btn_label(db)
     if item_key == GMAIL_PARENT:
         return _shop_btn_labels(db).get(item_key) or GMAIL_BTN_LABEL
+    if item_key == GMAIL_ICLOUD_ORDER_KEY:
+        return _shop_btn_labels(db).get(item_key) or GMAIL_ICLOUD_BTN_LABEL
     return _shop_btn_labels(db).get(item_key) or item_key
 
 def _shop_item_role(item_key):
@@ -27885,7 +28331,7 @@ def _callback_worker_impl(call):
             bot.answer_callback_query(call.id, "❌ No products!", show_alert=True); return
         _admin_sessions["del_product_list"] = {}
         markup = types.InlineKeyboardMarkup(row_width=1)
-        special_keys = {EDU_MAIL_PARENT, GMAIL_PARENT, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY}
+        special_keys = {EDU_MAIL_PARENT, GMAIL_PARENT, GMAIL_ICLOUD_ORDER_KEY, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY}
         for idx, key in enumerate(shop_keys):
             label_name = _shop_item_display_label(key, db)
             if key in special_keys:
