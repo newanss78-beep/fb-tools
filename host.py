@@ -9464,8 +9464,8 @@ def cb_gmail_icloud(call):
             name = _gic_detail_name(det, code)
             _pb = _gic_price_bdt(usd, dk, code)
             price_txt = f"{fmt_bdt_precise(_pb)}৳" if _pb is not None else "—"
-            if stock is not None:
-                price_txt += f"  |  📦 {int(stock)} in stock"
+            avail_txt = f"{int(stock)} pcs" if stock is not None else "—"
+            _dom_txt = "@" + str(domain or GIC_DOMAINS[dk][0]).lstrip("@")
             # 🛒 অন্য প্রোডাক্টের মতোই: ডিটেইল মেসেজ + নিচে Reply Keyboard এ "Buy one pice" বাটন
             _gic_pending_buy[uid] = (dk, code)
             _pending_product_cache.pop(uid, None)
@@ -9474,9 +9474,11 @@ def cb_gmail_icloud(call):
             kb = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
             kb.add(KbBtn(_L["single_buy"], role="buy_single"))
             kb.add(KbBtn("Back", role="back"))
-            bot.send_message(uid, f"{label} <b>({_gm_e(domain)})</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            bot.send_message(uid, f"{label}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
                                   + T("📦 Service: ", "📦 সার্ভিস: ") + f"<b>{_gm_e(name)}</b>\n"
+                                  + f"🌐 domain: <b>{_gm_e(_dom_txt)}</b>\n"
                                   + T("💰 Price: ", "💰 দাম: ") + f"<b>{price_txt}</b>\n"
+                                  + T("📦 Available: ", "📦 স্টক: ") + f"<b>{avail_txt}</b>\n"
                                   + T("⏱️ Validity: 20 minutes — auto refund if no code arrives.\n\n",
                                       "⏱️ মেয়াদ: ২০ মিনিট — কোড না এলে অটো refund।\n\n")
                                   + T(f"👇 Press the <b>{_gm_e(_L['single_buy'])}</b> button below to buy.",
@@ -14037,7 +14039,8 @@ def get_main_menu(uid):
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add( KbBtn(L["shop"], role="shop"), KbBtn(L["buy_proxy"], role="buy_proxy"))
     markup.add( KbBtn(L["balance"], role="balance"), KbBtn(L["deposit"], role="deposit"))
-    markup.add( KbBtn(L["twofa"], role="twofa"), KbBtn("💻 Code</>", role="code"))
+    # 🔍 Proxy checker এখন মেইন মেনুতে (আগে এখানে 2FA বাটন ছিল) — 2FA এখন শুধু /2fa_key কমান্ড
+    markup.add( KbBtn(kb_label("proxy_checker"), role="proxy_checker"), KbBtn("💻 Code</>", role="code"))
     markup.add( KbBtn(L["support"], role="support"), KbBtn(L["other"], role="other"))
     if is_admin(uid):
         markup.add( KbBtn(L["admin"], role="admin"))
@@ -14068,7 +14071,7 @@ def get_buy_proxy_menu(uid):
     ✅ Admin যেই বাটন Off করে রাখবে সেটা এখানে দেখানো হবে না।
     ✅ Admin rename করে থাকলে সেই নতুন নাম দেখাবে (kb_label)।"""
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
-    roles_in_order = ["proxy_real", "proxy_allvpn", "proxy_gb", "proxy_isp", "proxy_checker"]
+    roles_in_order = ["proxy_real", "proxy_allvpn", "proxy_gb", "proxy_isp"]
     row = []
     for role in roles_in_order:
         if not is_kb_button_enabled(role):
@@ -35218,6 +35221,8 @@ def _is_menu_navigation_text(user_id, text):
     for _role_label, _default in KB_BUTTON_ROLES.values():
         if text == _role_label:
             return True
+    if text == kb_label("proxy_checker"):
+        return True
     try:
         db_quick = load_db()
         if text in db_quick.get("products", {}):
@@ -36605,6 +36610,143 @@ H143_API_KEY = "812F454A38C516C942C25120A09CB1F8"
 H143_STATS_BASE_URL = "https://h143.xyz/stats"
 
 
+# ── H143 usage reader: stats endpoint থেকে JSON নিয়ে বাটন ছাড়া টেক্সটে দেখায় ──
+# FILL: h143.xyz এর আসল JSON endpoint নিশ্চিত না হলে এখানে বদলাও (browser devtools →
+#       Network → stats পেজ খুলে যে XHR/fetch যায় সেটা কপি করো)। {u}/{k} = username/api_key
+H143_USAGE_URLS = (
+    H143_STATS_BASE_URL + "?api_key={k}&username={u}",
+    "https://h143.xyz/api/stats?api_key={k}&username={u}",
+    "https://h143.xyz/api/usage?api_key={k}&username={u}",
+)
+H143_DEFAULT_UNIT = 1000 ** 2   # নামে/স্ট্রিংয়ে unit না থাকলে সংখ্যাটা কীসে ধরবে: 1000**2 = MB, 1 = bytes
+_H143_UNITS = {"b": 1, "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4}
+
+
+def _h143_flatten(obj, out=None):
+    out = {} if out is None else out
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                _h143_flatten(v, out)
+            else:
+                out.setdefault(str(k).lower(), v)
+    elif isinstance(obj, list) and obj and isinstance(obj[0], dict):
+        _h143_flatten(obj[0], out)
+    return out
+
+
+def _h143_to_bytes(key, val):
+    """সংখ্যা/স্ট্রিং ('67.16 MB') + key নাম থেকে unit ধরে bytes বানায়। না পারলে None।"""
+    m = re.match(r"^\s*(-?[\d,]*\.?\d+)\s*([kmgt]?b)?\s*$", str(val), re.IGNORECASE)
+    if not m:
+        return None
+    num = float(m.group(1).replace(",", ""))
+    unit = (m.group(2) or "").lower()
+    if not unit:
+        for u in ("tb", "gb", "mb", "kb"):
+            if re.search(rf"(?:^|_){u}(?:$|_)|{u}$", key):
+                unit = u
+                break
+        if not unit and "byte" in key:
+            unit = "b"
+    return num * (_H143_UNITS[unit] if unit else H143_DEFAULT_UNIT)
+
+
+def _h143_parse(js):
+    flat = _h143_flatten(js)
+    res = {"limit": None, "used": None, "remaining": None, "status": None}
+    for k, v in flat.items():
+        if v is None or isinstance(v, bool):
+            if res["status"] is None and any(w in k for w in ("status", "state", "active", "enabled")):
+                res["status"] = v
+            continue
+        if any(w in k for w in ("status", "state")) and res["status"] is None:
+            res["status"] = v
+            continue
+        if any(w in k for w in ("remain", "left", "balance")):
+            slot = "remaining"
+        elif any(w in k for w in ("limit", "quota", "total", "cap", "plan")):
+            slot = "limit"
+        elif any(w in k for w in ("used", "usage", "consumed")):
+            slot = "used"
+        else:
+            continue
+        if res[slot] is None:
+            b = _h143_to_bytes(k, v)
+            if b is not None:
+                res[slot] = b
+    if res["limit"] is None and res["used"] is not None and res["remaining"] is not None:
+        res["limit"] = res["used"] + res["remaining"]
+    if res["used"] is None and res["limit"] is not None and res["remaining"] is not None:
+        res["used"] = max(0.0, res["limit"] - res["remaining"])
+    if res["remaining"] is None and res["limit"] is not None and res["used"] is not None:
+        res["remaining"] = max(0.0, res["limit"] - res["used"])
+    if res["limit"] is None and res["used"] is None:
+        return None
+    return res
+
+
+def _h143_status_text(st):
+    if st is None:
+        return "🟢 Active"
+    if isinstance(st, bool):
+        return "🟢 Active" if st else "🔴 Disabled"
+    s = str(st).strip().lower()
+    if s in ("1", "active", "enabled", "ok", "true", "online", "running"):
+        return "🟢 Active"
+    if s in ("0", "disabled", "inactive", "false", "off"):
+        return "🔴 Disabled"
+    if "expire" in s:
+        return "🟠 Expired"
+    if "block" in s or "ban" in s or "suspend" in s:
+        return "🚫 Blocked"
+    return f"❔ {_hx(str(st))}"
+
+
+def h143_fetch_usage(username):
+    """রিটার্ন (info_dict, err)। err: None | 'not_found' | 'unavailable'।"""
+    headers = {"Accept": "application/json, text/plain, */*", "User-Agent": "Mozilla/5.0"}
+    for tpl in H143_USAGE_URLS:
+        url = tpl.format(k=H143_API_KEY, u=username)
+        try:
+            resp = http_requests.get(url, headers=headers, timeout=20)
+        except Exception as e:
+            logging.warning(f"h143 usage request failed: {type(e).__name__}")
+            continue
+        if resp.status_code == 404:
+            continue
+        try:
+            js = resp.json()
+        except Exception:
+            logging.warning(f"h143 usage non-JSON: {url.split('?')[0]} status={resp.status_code} body={resp.text[:200]!r}")
+            continue
+        info = _h143_parse(js)
+        if info:
+            info["status_raw"] = info.get("status")
+            return info, None
+        logging.warning(f"h143 usage unparsed JSON: {str(js)[:300]}")
+    return None, "unavailable"
+
+
+def _h143_render_usage(username, info):
+    limit, used, rem = info["limit"], info["used"] or 0, info["remaining"]
+    reply = (
+        "🔍 <b>H143 Proxy — Usage Checker</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Username:</b> <code>{_hx(username)}</code>\n"
+        f"📶 <b>Status:</b> {_h143_status_text(info.get('status_raw'))}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    if limit:
+        reply += f"🎯 <b>Plan Limit:</b> <code>{_nineproxy_format_bytes(limit)}</code>\n"
+    reply += f"📊 <b>Used:</b> <code>{_nineproxy_format_bytes(used)}</code>\n"
+    if rem is not None:
+        reply += f"🟢 <b>Remaining:</b> <code>{_nineproxy_format_bytes(max(0, rem))}</code>\n"
+    reply += _nineproxy_progress_bar(used, limit)
+    return reply
+
+
+
 def process_proxychk_h143_input(message):
     user_id = str(message.chat.id)
     lang = get_user_lang(user_id)
@@ -36637,11 +36779,42 @@ def process_proxychk_h143_input(message):
         return
 
     stats_url = f"{H143_STATS_BASE_URL}?api_key={H143_API_KEY}&username={username}"
+
+    wait_msg = None
+    try:
+        wait_msg = bot.send_message(user_id, "⏳ <b>Checking usage...</b>", parse_mode="HTML")
+    except Exception:
+        pass
+
+    info, err = h143_fetch_usage(username)
+
+    if wait_msg is not None:
+        try:
+            bot.delete_message(user_id, wait_msg.message_id)
+        except Exception:
+            pass
+
+    if info:
+        bot.send_message(user_id, _h143_render_usage(username, info),
+            parse_mode="HTML", reply_markup=get_other_menu(user_id))
+        return
+
+    if err == "not_found":
+        bot.send_message(user_id,
+            "🔍 <b>H143 Proxy — Usage Checker</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>Username:</b> <code>{username}</code>\n\n"
+            "❌ <b>Not Found</b>\n"
+            "<i>No account found with this username. Please double-check and try again.</i>",
+            parse_mode="HTML", reply_markup=get_other_menu(user_id))
+        return
+
+    # API থেকে পড়া গেলো না → আগের মতো Mini Web App বাটন (fallback)
     markup = types.InlineKeyboardMarkup()
     markup.add(InlineBtn("📊 View H143 Stats", style="primary",
                           web_app=types.WebAppInfo(stats_url)))
     bot.send_message(user_id,
-        "🅷 <b>H143 Proxy — Usage Checker</b>\n"
+        "🔍 <b>H143 Proxy — Usage Checker</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>Username:</b> <code>{username}</code>\n\n"
         "👇 Tap below to view your usage stats:",
