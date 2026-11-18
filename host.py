@@ -490,6 +490,24 @@ _UI_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="ui_worker"
 # webhook update প্রসেসিংয়ের থ্রেডও শেষ হয়ে যেত → বট চুপ, কিন্তু webhook 200 দিত।
 _DB_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="db_writer")
 
+# 🆕 FIX (silent failures): ThreadPoolExecutor এর ভেতরের error কেউ result() না নিলে
+# নিঃশব্দে হারিয়ে যায় — বট চুপ থাকে কিন্তু লগে কিছু আসে না। এই wrapper প্রতিটা
+# error লগে ছাপে (এবং আগের মতোই re-raise করে, যাতে future.result() এর আচরণ বদলায় না)।
+def _wrap_executor_logging(_ex):
+    _orig_submit = _ex.submit
+    def _submit(fn, *a, **k):
+        def _w():
+            try:
+                return fn(*a, **k)
+            except Exception:
+                logging.exception(f"❌ worker error in {getattr(fn, '__name__', fn)}")
+                raise
+        return _orig_submit(_w)
+    _ex.submit = _submit
+
+for _ex_obj in (_EXECUTOR, _UI_EXECUTOR, _DB_EXECUTOR):
+    _wrap_executor_logging(_ex_obj)
+
 # ═══════════════════════════════════════════════════════════
 # 🛑 GRACEFUL SHUTDOWN — Redeploy/Restart এ pending MySQL write হারানো ঠেকাতে
 # ═══════════════════════════════════════════════════════════
@@ -8327,7 +8345,7 @@ def start_sms_server():
                 "my_chat_member", "channel_post", "inline_query"
             ]
         )
-        print(f"✅ Telegram Webhook set: {WEBHOOK_URL}")
+        print("✅ Telegram Webhook set: (URL hidden — টোকেন সুরক্ষার জন্য)")
     except Exception as e:
         print(f"❌ Webhook set failed: {e}")
 
@@ -37147,5 +37165,5 @@ if __name__ == "__main__":
     # SMS + Telegram Webhook server — foreground এ চালাও
     # infinity_polling বন্ধ — Webhook mode এ switch হয়েছে ✅
     print("🌐 Starting Webhook+SMS server on port 5000...")
-    print(f"🔗 Telegram Webhook URL: {WEBHOOK_URL}")
+    print("🔗 Telegram Webhook URL: (hidden)")
     start_sms_server()
