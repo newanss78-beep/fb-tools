@@ -8413,6 +8413,9 @@ GMAIL_BTN_LABEL = "📮 Gmail API"   # Buy Mail শপ মেনুতে ইউ
 # 📬 Gmail & iCloud — Buy Mail শপ মেনুর নতুন বাটন (ভিতরে Gmail ও iCloud ২টা inline বাটন)
 GMAIL_ICLOUD_ORDER_KEY = "__gmail_icloud__"      # internal key (DB order/hide সেটিং এর জন্য — বদলাবেন না)
 GMAIL_ICLOUD_BTN_LABEL = "📬 Gmail & iCloud"     # Buy Mail শপ মেনুতে ইউজার যে নামে বাটনটা দেখে
+# 📱 Number OTP — Buy Mail শপ মেনুর নতুন বাটন (bulkmail.shop OTP numbers, kind=sms)
+NUMBER_OTP_ORDER_KEY = "__number_otp__"          # internal key (DB order/hide সেটিং এর জন্য — বদলাবেন না)
+NUMBER_OTP_BTN_LABEL = "📱 Number OTP"           # Buy Mail শপ মেনুতে ইউজার যে নামে বাটনটা দেখে
 # 📨 Hotmail & Outlook — Buy Mail শপ মেনুর নতুন বাটন (ভিতরে Hotmail ও Outlook ২টা inline বাটন)
 HOTMAIL_OUTLOOK_ORDER_KEY = "__hotmail_outlook__"      # internal key (DB order/hide সেটিং এর জন্য — বদলাবেন না)
 HOTMAIL_OUTLOOK_BTN_LABEL = "📨 Hotmail & Outlook"     # Buy Mail শপ মেনুতে ইউজার যে নামে বাটনটা দেখে
@@ -8957,6 +8960,45 @@ def _gic_find_option(obj, dk):
     return domain, st["price"], None, None
 
 
+def _gic_find_stock_level(obj, dk):
+    """/otp/services/mail/{service} রেসপন্সে Gmail/iCloud provider এর "stock_level" (high/medium/low) খোঁজে।
+    API সংখ্যা না দিয়ে শুধু level দিলে "Available" এ সেটাই live দেখানো হয়। না পেলে None।"""
+    kw = GIC_DOMAINS[dk][0].split(".")[0]
+    found = {"lv": None}
+
+    def walk(o):
+        if found["lv"] is not None:
+            return
+        if isinstance(o, dict):
+            texts = [v for v in o.values() if isinstance(v, str)]
+            lv = o.get("stock_level")
+            if isinstance(lv, str) and lv.strip() and any(kw in t.lower() for t in texts):
+                found["lv"] = lv.strip().lower()
+                return
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(obj)
+    return found["lv"]
+
+
+def _gic_stock_text(uid, stock, level, listed):
+    """"📦 Available" লাইনের লেখা — সংখ্যা থাকলে "N pcs", না থাকলে stock level, তাও না থাকলে "In stock"।"""
+    if stock is not None:
+        return f"{int(stock)} pcs"
+    lv = str(level or "").strip().lower()
+    names = {"high": ("🟢 High", "🟢 বেশি"), "medium": ("🟡 Medium", "🟡 মাঝারি"), "low": ("🟠 Low", "🟠 কম")}
+    if lv in names:
+        return _gic_t(uid, *names[lv])
+    if lv:
+        return lv.title()
+    if listed is True:
+        return _gic_t(uid, "✅ In stock", "✅ স্টকে আছে")
+    return "—"
+
+
 def _gic_pricing_cfg():
     """(profit_percent, manual_overrides) — Admin Panel → 💲 Gmail & iCloud Price থেকে সেট করা।
     DB: /settings/gic_pricing = {"markup": %, "overrides": {"g_<code>": bdt, "i_<code>": bdt}}"""
@@ -9051,6 +9093,8 @@ def _gic_popularity(dk):
 def _gic_services_view(dk, page, uid):
     """সার্ভিস লিস্টের (text, markup) — ২ কলামে inline বাটন "Facebook [2৳]" + Prev/Next।
     🔥 সবচেয়ে বেশি কেনা সার্ভিসগুলো আগে (বেশি→কম ক্রমে), বাকিগুলো API এর ক্রমে।"""
+    if str(dk).startswith("N|"):           # 📱 Number OTP — দেশের লিস্টে ফেরা (Back এর জন্য)
+        return _notp_countries_view(str(dk)[2:], page, uid)
     domain, label = GIC_DOMAINS[dk]
     allsv = _gic_all_services()
     if not allsv:
@@ -9235,16 +9279,19 @@ def _gic_refund(user_id, oid, reason=""):
 def _gic_order_text(od, uid, header=""):
     email_addr = od.get("email") or od.get("phone_number") or "—"
     code = od.get("code")
-    lines = [header or "📬 <b>Mail Order</b>", "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
-             f"📧 <code>{_gm_e(email_addr)}</code>"]
+    _is_phone = (not od.get("email")) and bool(od.get("phone_number"))
+    lines = [header or ("📱 <b>Number Order</b>" if _is_phone else "📬 <b>Mail Order</b>"), "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+             f"{'📱' if _is_phone else '📧'} <code>{_gm_e(email_addr)}</code>"]
     if code:
         lines.append(f"🔑 Code: <code>{_gm_e(code)}</code>")
         extra = [c.get("code") for c in (od.get("codes") or []) if isinstance(c, dict) and c.get("code") and c.get("code") != code]
         if extra:
             lines.append(_gic_t(uid, "🕘 Previous codes: ", "🕘 আগের কোড: ") + ", ".join(f"<code>{_gm_e(c)}</code>" for c in extra[:5]))
     else:
-        lines.append(_gic_t(uid, "⏳ Waiting for the code… (send the verification to this mail)",
-                            "⏳ কোডের জন্য অপেক্ষা করা হচ্ছে… (মেইলে ভেরিফিকেশন পাঠান)"))
+        lines.append(_gic_t(uid, "⏳ Waiting for the code… (request the verification on this number)" if _is_phone
+                            else "⏳ Waiting for the code… (send the verification to this mail)",
+                            "⏳ কোডের জন্য অপেক্ষা করা হচ্ছে… (এই নম্বরে ভেরিফিকেশন পাঠান)" if _is_phone
+                            else "⏳ কোডের জন্য অপেক্ষা করা হচ্ছে… (মেইলে ভেরিফিকেশন পাঠান)"))
     return "\n".join(lines)
 
 
@@ -9296,6 +9343,8 @@ _gic_pending_buy = {}      # {user_id: (dk, service_code)} — Reply Keyboard "B
 def _gic_do_buy(uid, dk, code, chat_id=None):
     uid = str(uid)
     chat_id = chat_id or uid
+    if dk == "N":                          # 📱 Number OTP কেনা
+        return _notp_do_buy(uid, code, chat_id)
     domain, label = GIC_DOMAINS[dk]
     T = lambda en, bn: _gic_t(uid, en, bn)
     if not BULKMAIL_API_KEY:
@@ -9351,6 +9400,16 @@ def _gic_do_buy(uid, dk, code, chat_id=None):
     bot.send_message(uid, _gic_order_text(od, uid, T(f"✅ <b>{label} — Purchase complete</b>\n💰 {fmt_bdt_precise(price_bdt)}৳",
                                                      f"✅ <b>{label} — কেনা সম্পূর্ণ</b>\n💰 {fmt_bdt_precise(price_bdt)}৳")),
                      parse_mode="HTML", reply_markup=_gic_order_markup(oid, uid))
+    try:    # 📢 লগ চ্যানেলে Purchase লগ (অন্য প্রোডাক্টের মতো — ইউজার আইডি/অর্ডার আইডি মাস্ক করা, মেইল ঠিকানা যায় না)
+        bot.send_message(LOG_CHANNEL_ID,
+            f"🛒 <b>Purchase Successful!</b>🎉\n\n"
+            f"👤 <b>User ID:</b> <code>{mask_id(uid)}</code>\n"
+            f"📦 <b>Product:</b> {_gm_e(label)} · {_gm_e(od.get('service_name') or name)}\n"
+            f"💰 <b>Total:</b> {fmt_bdt_precise(price_bdt)} BDT\n"
+            f"🆔 <b>Order ID:</b> <code>{mask_id(f'GIC{oid}')}</code>\n"
+            f"📅 <b>Date:</b> {entry['date']}", parse_mode="HTML")
+    except Exception as e:
+        logging.warning(f"gic log channel error: {e}")
     threading.Thread(target=_gic_poll_worker, args=(uid, oid, chat_id), daemon=True,
                      name=f"gic_poll_{oid}").start()
 
@@ -9362,7 +9421,9 @@ def _gic_user_orders(user_id):
     """ইউজারের Gmail & iCloud অর্ডারগুলো — নতুন আগে।"""
     db = load_db()
     u = db["users"].get(str(user_id)) or {}
-    items = [o for o in _normalize_orders_list(u.get("orders", [])) if isinstance(o, dict) and o.get("gic_id") is not None]
+    # 📱 Number OTP অর্ডার এই হিস্টোরি/সার্চে দেখানো হয় না (শুধু Gmail/iCloud মেইল)
+    items = [o for o in _normalize_orders_list(u.get("orders", []))
+             if isinstance(o, dict) and o.get("gic_id") is not None and o.get("source") != "number_otp"]
     return list(reversed(items))
 
 
@@ -9497,7 +9558,10 @@ def cb_gmail_icloud(call):
             price_txt = f"{fmt_bdt_precise(_pb)}৳" if _pb is not None else "—"
             if stock is None:
                 stock = _gic_stock_cache.get(code)      # ডিটেইলে না থাকলে লিস্টের স্টক ব্যবহার
-            avail_txt = f"{int(stock)} pcs" if stock is not None else "—"
+            _lvl = _gic_find_stock_level(det.get("data", det), dk) if stock is None else None
+            if stock is None and _lvl is None:
+                logging.warning(f"gic stock info missing dk={dk} service={code} listed={listed} resp={str(det)[:800]}")
+            avail_txt = _gic_stock_text(uid, stock, _lvl, listed)       # 📦 Available = live stock (সংখ্যা / level / In stock)
             _dom_txt = "@" + str(domain or GIC_DOMAINS[dk][0]).lstrip("@")
             # 🛒 অন্য প্রোডাক্টের মতোই: ডিটেইল মেসেজ + নিচে Reply Keyboard এ "Buy one pice" বাটন
             _gic_pending_buy[uid] = (dk, code)
@@ -9564,6 +9628,353 @@ def cb_gmail_icloud(call):
             bot.send_message(uid, T("⚠️ Something went wrong, please try again.", "⚠️ কিছু একটা সমস্যা হয়েছে, আবার চেষ্টা করুন।"))
         except Exception:
             pass
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 📱 NUMBER OTP — Buy Mail মেনুর বাটন → সার্ভিস লিস্ট → ২৫টা করে popular দেশ (৩ পেজ) → ডিটেইল + Buy/Back
+#   bulkmail.shop v2 OTP endpoint (kind=sms):
+#     GET  /otp/services?kind=sms&search=…   → সার্ভিসের code খোঁজা (১ ঘণ্টা cache)
+#     GET  /otp/services/sms/{service}       → দেশ + দাম (price_from) + stock_level / in_stock (live)
+#     POST /otp/buy {kind:sms, service, country} → নম্বর কেনা (সবচেয়ে সস্তা option)
+#     GET  /otp/orders/{id}                  → কোড পোল (আগের Gmail/iCloud এর poll/check/next/cancel/refund ই ব্যবহার হয়)
+#   দাম = API দাম (USD) × ডলার রেট + 💲 Gmail & iCloud Price এ সেট করা Profit %।
+#   অর্ডারগুলো "📜 My Mail & OTP History" তেও দেখা যায়।
+# ───────────────────────────────────────────────────────────────────────────
+NOTP_PAGE_SIZE = 25
+# (বাটনের নাম, emoji, খোঁজার শব্দ, বাদ দেওয়ার শব্দ)
+NOTP_SERVICES = [
+    ("Facebook", "📘", ("facebook",), ()),
+    ("Instagram", "📸", ("instagram",), ()),
+    ("Telegram", "✈️", ("telegram",), ()),
+    ("WhatsApp", "💬", ("whatsapp",), ()),
+    ("Gmail", "📮", ("gmail", "google"), ("voice",)),
+    ("Amazon", "📦", ("amazon",), ()),
+    ("Discord", "🎮", ("discord",), ()),
+    ("Netflix", "🎬", ("netflix",), ()),
+    ("Tinder", "🔥", ("tinder",), ()),
+    ("X/Twitter", "🐦", ("twitter",), ()),
+    ("Uber", "🚗", ("uber",), ()),
+    ("Viber", "📞", ("viber",), ()),
+    ("WeChat", "🟢", ("wechat",), ()),
+    ("TikTok", "🎵", ("tiktok",), ()),
+    ("Snapchat", "👻", ("snapchat",), ()),
+    ("Imo Messenger", "💙", ("imo",), ()),
+    ("Google Voice", "🎙️", ("google voice", "googlevoice"), ()),
+    ("Cash App", "💵", ("cash app", "cashapp"), ()),
+    ("PayPal", "💳", ("paypal",), ()),
+    ("Paysafe Card", "🏧", ("paysafecard", "paysafe"), ()),
+    ("Any Other", "🌐", ("any other",), ()),
+]
+# শুধু popular দেশ (ISO code) — এই ক্রমেই দেখায়, ২৫টা করে ৩ পেজ
+NOTP_POPULAR = [
+    "US", "GB", "CA", "AU", "DE", "FR", "ES", "IT", "NL", "SE", "PL", "UA", "RU", "TR", "IN", "ID", "PH", "VN", "TH", "MY", "SG", "HK", "TW", "JP", "KR",
+    "BR", "MX", "AR", "CO", "CL", "PE", "ZA", "NG", "KE", "EG", "MA", "SA", "AE", "IL", "PK", "BD", "LK", "KZ", "RO", "CZ", "PT", "BE", "AT", "CH",
+    "IE", "DK", "NO", "FI", "GR", "HU", "BG", "RS", "HR", "SK", "LT", "LV", "EE", "NZ", "KH", "MM", "NP", "GH", "TZ", "DZ", "TN", "IQ", "JO", "EC", "VE", "UY",
+]
+_notp_codes = {"t": 0, "map": {}}       # {idx: (service_code, api_name)} — ১ ঘণ্টা cache
+_notp_lock = threading.Lock()
+_notp_cc_cache = {}                     # {service_code: (ts, {CC: country_dict})} — ৩০ সেকেন্ড (পেজ ঘোরানোর জন্য)
+
+
+def _notp_norm(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _notp_find_service(terms, exclude=()):
+    best, best_score = None, 0
+    for term in terms:
+        data, _st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/services",
+                                  params={"kind": "sms", "search": term, "per_page": 100},
+                                  headers=_gic_headers(), timeout=12, retries=1, tag="notp resolve")
+        if not data or data.get("success") is False:
+            continue
+        t = _notp_norm(term)
+        for sv in _gic_list_items(data):
+            if not isinstance(sv, dict):
+                continue
+            code, name, _p = _gic_svc_fields(sv)
+            if not code or any(x in str(name).lower() for x in exclude):
+                continue
+            n = _notp_norm(name)
+            if n == t:
+                sc = 3
+            elif len(t) > 3 and n.startswith(t):
+                sc = 2
+            elif len(t) > 3 and t in n:
+                sc = 1
+            else:
+                sc = 0
+            if sc > best_score:
+                best, best_score = (str(code), str(name)), sc
+        if best_score == 3:
+            break
+    return best
+
+
+def _notp_map():
+    """{idx: (code, name)} — প্রতিটা সার্ভিসের API code (সমান্তরালে খুঁজে ১ ঘণ্টা cache)।"""
+    import time as _t
+    with _notp_lock:
+        if _notp_codes["map"] and _t.time() - _notp_codes["t"] < 3600:
+            return _notp_codes["map"]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=7) as ex:
+        res = list(ex.map(lambda sv: _notp_find_service(sv[2], sv[3]), NOTP_SERVICES))
+    m = {i: r for i, r in enumerate(res) if r}
+    missing = [NOTP_SERVICES[i][0] for i in range(len(NOTP_SERVICES)) if i not in m]
+    if missing:
+        logging.warning(f"notp: service code পাওয়া যায়নি: {missing}")
+    if m:
+        with _notp_lock:
+            _notp_codes["map"], _notp_codes["t"] = m, _t.time()
+        return m
+    return _notp_codes["map"]
+
+
+def _notp_country_data(code, fresh=False):
+    """({CC: country_dict}, "") অথবা (None, error)। fresh=True হলে cache ছাড়া live।"""
+    import time as _t
+    c = _notp_cc_cache.get(code)
+    if not fresh and c and _t.time() - c[0] < 30:
+        return c[1], ""
+    det, st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/services/sms/{code}", headers=_gic_headers(),
+                            timeout=15, retries=1, tag="notp countries")
+    if not det or det.get("success") is False:
+        return None, _gic_err(det, st)
+    d = det.get("data", det)
+    out = {}
+    for ct in (d.get("countries") if isinstance(d, dict) else None) or []:
+        if isinstance(ct, dict):
+            cc = str(ct.get("country") or "").upper()
+            if cc:
+                out[cc] = ct
+    _notp_cc_cache[code] = (_t.time(), out)
+    return out, ""
+
+
+def _notp_flag(cc):
+    cc = str(cc or "").upper()
+    if len(cc) == 2 and cc.isalpha():
+        return "".join(chr(0x1F1E6 + ord(ch) - 65) for ch in cc)
+    return "🌍"
+
+
+def _notp_country_usd(ct):
+    """দেশের সবচেয়ে কম দাম (USD): price_from, না থাকলে options এর min।"""
+    p = _gic_num(ct.get("price_from"))
+    if p is None:
+        ps = [_gic_num(o.get("price")) for o in (ct.get("options") or []) if isinstance(o, dict)]
+        ps = [x for x in ps if x is not None]
+        p = min(ps) if ps else None
+    return p
+
+
+def _notp_services_view(uid):
+    m = _notp_map()
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    btns = [InlineBtn(f"{em} {label}", style="primary", callback_data=f"notp_svc|{i}|1")
+            for i, (label, em, _t, _x) in enumerate(NOTP_SERVICES) if i in m]
+    for i in range(0, len(btns), 2):
+        markup.row(*btns[i:i + 2])
+    if not btns:
+        return (_gic_t(uid, "⚠️ Could not load the service list. Please try again.", "⚠️ সার্ভিস লিস্ট আনা যায়নি। আবার চেষ্টা করুন।")), markup
+    return ("📱 <b>Number OTP</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            + _gic_t(uid, "Which service do you need the number for?", "কোন সার্ভিসের জন্য নম্বর কিনবেন?")), markup
+
+
+def _notp_countries_view(key, page, uid):
+    """একটা সার্ভিসের popular দেশের লিস্ট — প্রতি পেজে ২৫টা, সর্বোচ্চ ৩ পেজ।"""
+    back = types.InlineKeyboardMarkup(row_width=1)
+    back.row(InlineBtn("🔙 Back", callback_data="notp_home"))
+    try:
+        idx = int(key)
+        code, _n = _notp_map()[idx]
+        label, em = NOTP_SERVICES[idx][0], NOTP_SERVICES[idx][1]
+    except Exception:
+        return _gic_t(uid, "⚠️ Service not available.", "⚠️ সার্ভিসটি পাওয়া যাচ্ছে না।"), back
+    cdata, err = _notp_country_data(code)
+    if cdata is None:
+        return (_gic_t(uid, "⚠️ Could not load countries: ", "⚠️ দেশের লিস্ট আনা যায়নি: ") + _gm_e(err)), back
+    ordered = [cc for cc in NOTP_POPULAR if cc in cdata]
+    total_pages = max(1, -(-len(ordered) // NOTP_PAGE_SIZE))
+    page = min(max(1, page), total_pages)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    btns = []
+    for cc in ordered[(page - 1) * NOTP_PAGE_SIZE: page * NOTP_PAGE_SIZE]:
+        ct = cdata[cc]
+        usd = _notp_country_usd(ct)
+        pb = _gic_price_bdt(usd) if usd is not None else None
+        name = str(ct.get("country_name") or cc)
+        shown = name if len(name) <= 13 else name[:12] + "…"
+        ptxt = f" [{fmt_bdt_precise(pb)}৳]" if pb is not None else ""
+        btns.append(InlineBtn(f"{_notp_flag(cc)} {shown}{ptxt}",
+                              style="danger" if ct.get("in_stock") is False else "primary",
+                              callback_data=f"notp_pick|{idx}|{cc}|{page}"))
+    for i in range(0, len(btns), 2):
+        markup.row(*btns[i:i + 2])
+    nav = []
+    if page > 1:
+        nav.append(InlineBtn("⬅️ Prev", callback_data=f"notp_svc|{idx}|{page - 1}"))
+    if page < total_pages:
+        nav.append(InlineBtn("Next ➡️", callback_data=f"notp_svc|{idx}|{page + 1}"))
+    if nav:
+        markup.row(*nav)
+    markup.row(InlineBtn("🔙 Back", callback_data="notp_home"))
+    if not btns:
+        return f"{em} <b>{_gm_e(label)}</b>\n\n" + _gic_t(uid, "🚧 No countries available right now.", "🚧 এই মুহূর্তে কোনো দেশ পাওয়া যায়নি।"), markup
+    return (f"{em} <b>{_gm_e(label)}</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            + _gic_t(uid, "Choose a country", "দেশ বেছে নিন")
+            + (f"\nPage {page}/{total_pages}" if total_pages > 1 else "")), markup
+
+
+def _show_number_otp_menu(user_id, db=None):
+    """Buy Mail মেনুর 📱 Number OTP বাটন চাপলে।"""
+    user_id = str(user_id)
+    _pending_product_cache.pop(user_id, None)
+    _pending_product_origin.pop(user_id, None)
+    _gic_pending_buy.pop(user_id, None)
+    _gic_last_view.pop(user_id, None)
+    text, markup = _notp_services_view(user_id)
+    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("notp_"))
+def cb_number_otp(call):
+    uid = str(call.from_user.id)
+    T = lambda en, bn: _gic_t(uid, en, bn)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    if _gm_banned(uid) or not enforce_join_gate(uid, call):
+        return
+    try:
+        parts = call.data.split("|")
+        act = parts[0]
+        if act == "notp_home":
+            _gic_last_view.pop(uid, None)
+            text, markup = _notp_services_view(uid)
+            _gic_edit_or_send(uid, call, text, markup)
+        elif act == "notp_svc":
+            idx, page = int(parts[1]), int(parts[2])
+            text, markup = _notp_countries_view(str(idx), page, uid)
+            _gic_last_view[uid] = (f"N|{idx}", page)
+            _gic_edit_or_send(uid, call, text, markup)
+        elif act == "notp_pick":
+            idx, cc, page = int(parts[1]), parts[2].upper(), int(parts[3])
+            code, _n = _notp_map()[idx]
+            label, em = NOTP_SERVICES[idx][0], NOTP_SERVICES[idx][1]
+            cdata, err = _notp_country_data(code, fresh=True)
+            if cdata is None:
+                bot.send_message(uid, T("⚠️ Could not load info: ", "⚠️ তথ্য আনা যায়নি: ") + _gm_e(err), parse_mode="HTML"); return
+            ct = cdata.get(cc)
+            if not ct or ct.get("in_stock") is False:
+                bot.send_message(uid, T("🚧 Out of stock for this country right now.", "🚧 এই দেশের জন্য এখন স্টক নেই।")); return
+            usd = _notp_country_usd(ct)
+            pb = _gic_price_bdt(usd) if usd is not None else None
+            price_txt = f"{fmt_bdt_precise(pb)}৳" if pb is not None else "—"
+            stock = _gic_first_num(ct, _GIC_STOCK_KEYS)
+            avail_txt = _gic_stock_text(uid, stock, ct.get("stock_level"), True)
+            _gic_pending_buy[uid] = ("N", f"{idx}|{cc}")
+            _gic_last_view[uid] = (f"N|{idx}", page)
+            _pending_product_cache.pop(uid, None)
+            _pending_product_origin[uid] = "gic"
+            _L = LANG[get_user_lang(uid)]
+            kb = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+            kb.add(KbBtn(_L["single_buy"], role="buy_single"))
+            kb.add(KbBtn("Back", role="back"))
+            bot.send_message(uid, "📱 <b>Number OTP</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+                                  + T("📦 Service: ", "📦 সার্ভিস: ") + f"<b>{em} {_gm_e(label)}</b>\n"
+                                  + T("🌍 Country: ", "🌍 দেশ: ") + f"<b>{_notp_flag(cc)} {_gm_e(ct.get('country_name') or cc)}</b>\n"
+                                  + T("💰 Price: ", "💰 দাম: ") + f"<b>{price_txt}</b>\n"
+                                  + T("📦 Stock: ", "📦 স্টক: ") + f"<b>{avail_txt}</b>\n"
+                                  + T("⏱️ Validity: 20 minutes — auto refund if no code arrives.\n\n",
+                                      "⏱️ মেয়াদ: ২০ মিনিট — কোড না এলে অটো refund।\n\n")
+                                  + T(f"👇 Press the <b>{_gm_e(_L['single_buy'])}</b> button below to buy.",
+                                      f"👇 কিনতে নিচের <b>{_gm_e(_L['single_buy'])}</b> বাটন চাপুন।"),
+                             parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logging.error(f"notp callback error ({call.data}): {e}\n{traceback.format_exc()}")
+        try:
+            bot.send_message(uid, T("⚠️ Something went wrong, please try again.", "⚠️ কিছু একটা সমস্যা হয়েছে, আবার চেষ্টা করুন।"))
+        except Exception:
+            pass
+
+
+def _notp_do_buy(uid, key, chat_id=None):
+    """📱 Number OTP কেনা — 'Buy one pice' চাপলে (_gic_do_buy থেকে dk="N" হলে এখানে আসে)।"""
+    uid = str(uid)
+    chat_id = chat_id or uid
+    T = lambda en, bn: _gic_t(uid, en, bn)
+    try:
+        idx_s, cc = key.split("|", 1)
+        idx = int(idx_s)
+    except Exception:
+        return
+    if not BULKMAIL_API_KEY:
+        bot.send_message(uid, T("⚠️ This service is currently unavailable (API key not set). Please contact admin.",
+                                "⚠️ সার্ভিস এখন বন্ধ আছে (API key সেট নেই)। Admin কে জানান।"))
+        return
+    try:
+        code, _n = _notp_map()[idx]
+    except Exception:
+        bot.send_message(uid, T("⚠️ Service not available.", "⚠️ সার্ভিসটি পাওয়া যাচ্ছে না।")); return
+    label, em = NOTP_SERVICES[idx][0], NOTP_SERVICES[idx][1]
+    cdata, err = _notp_country_data(code, fresh=True)
+    if cdata is None:
+        bot.send_message(uid, T("⚠️ Could not load info: ", "⚠️ তথ্য আনা যায়নি: ") + _gm_e(err), parse_mode="HTML"); return
+    ct = cdata.get(cc)
+    if not ct or ct.get("in_stock") is False:
+        bot.send_message(uid, T("🚧 Out of stock for this country right now.", "🚧 এই দেশের জন্য এখন স্টক নেই।")); return
+    price_bdt = _gic_price_bdt(_notp_country_usd(ct))
+    if price_bdt is None:
+        bot.send_message(uid, T("⚠️ Price not available. Please try again later.", "⚠️ দাম পাওয়া যায়নি। একটু পরে আবার চেষ্টা করুন।")); return
+    db = load_db()
+    if float(db["users"].get(uid, {}).get("balance", 0)) < price_bdt:
+        bot.send_message(uid, T(f"❌ <b>Insufficient balance!</b>\n\nPrice: <b>{fmt_bdt_precise(price_bdt)}৳</b>\nPlease deposit first.",
+                                f"❌ <b>ব্যালেন্স কম!</b>\n\nদাম: <b>{fmt_bdt_precise(price_bdt)}৳</b>\nআগে ডিপোজিট করুন।"), parse_mode="HTML")
+        return
+    res, st2 = _gic_post("/otp/buy", {"kind": "sms", "service": code, "country": cc})
+    if not res or res.get("success") is False:
+        msgs = {402: T("Supplier balance is empty — please contact admin.", "সাপ্লায়ারের ব্যালেন্স শেষ — Admin কে জানান।"),
+                404: T("This country is not available right now.", "এই দেশ এখন নেই।"),
+                409: T("Out of stock / option changed.", "স্টক শেষ / অপশন বদলে গেছে।")}
+        bot.send_message(uid, T("❌ <b>Purchase failed:</b> ", "❌ <b>কেনা যায়নি:</b> ") + _gm_e(msgs.get(st2) or _gic_err(res, st2))
+                         + T("\n(You were not charged)", "\n(আপনার টাকা কাটা হয়নি)"), parse_mode="HTML")
+        return
+    d = res.get("data", res)
+    od = d.get("order", d) if isinstance(d, dict) else {}
+    oid = od.get("id")
+    if oid is None:
+        bot.send_message(uid, T("⚠️ Order ID not received, please contact admin.", "⚠️ অর্ডার আইডি পাওয়া যায়নি, Admin কে জানান।"))
+        logging.error(f"notp buy: no order id in {res}")
+        return
+    real_usd = _gic_num(od.get("price"))
+    charge = _gic_price_bdt(real_usd) if real_usd is not None else price_bdt       # কেনার মুহূর্তের আসল দাম
+    cname = ct.get("country_name") or cc
+    phone = od.get("phone_number") or ""
+    entry = {"id": f"GIC{oid}", "gic_id": oid, "product_name": f"📱 Number OTP · {label} ({cname})",
+             "quantity": 1, "price_per_unit": charge, "total": charge,
+             "date": _time_module.strftime("%Y-%m-%d %H:%M:%S"), "status": "completed", "source": "number_otp",
+             "email": phone, "phone_number": phone}
+    if not _gic_charge(uid, charge, entry):
+        _gic_post(f"/otp/orders/{oid}/cancel")      # ২ মিনিটের আগে ক্যানসেল না হলে মেয়াদ শেষে সাপ্লায়ার নিজেই refund করে
+        bot.send_message(uid, T("❌ Insufficient balance — order cancelled.", "❌ ব্যালেন্স কম — অর্ডার বাতিল হয়েছে।"))
+        return
+    hdr = T(f"✅ <b>📱 Number purchase complete</b>\n{em} {_gm_e(label)} · {_notp_flag(cc)} {_gm_e(cname)}\n💰 {fmt_bdt_precise(charge)}৳",
+            f"✅ <b>📱 নম্বর কেনা সম্পূর্ণ</b>\n{em} {_gm_e(label)} · {_notp_flag(cc)} {_gm_e(cname)}\n💰 {fmt_bdt_precise(charge)}৳")
+    bot.send_message(uid, _gic_order_text(od, uid, hdr), parse_mode="HTML", reply_markup=_gic_order_markup(oid, uid))
+    try:    # 📢 লগ চ্যানেল
+        bot.send_message(LOG_CHANNEL_ID,
+            f"🛒 <b>Purchase Successful!</b>🎉\n\n"
+            f"👤 <b>User ID:</b> <code>{mask_id(uid)}</code>\n"
+            f"📦 <b>Product:</b> 📱 Number OTP · {_gm_e(label)} ({_gm_e(cname)})\n"
+            f"💰 <b>Total:</b> {fmt_bdt_precise(charge)} BDT\n"
+            f"🆔 <b>Order ID:</b> <code>{mask_id(f'GIC{oid}')}</code>\n"
+            f"📅 <b>Date:</b> {entry['date']}", parse_mode="HTML")
+    except Exception as e:
+        logging.warning(f"notp log channel error: {e}")
+    threading.Thread(target=_gic_poll_worker, args=(uid, oid, chat_id), daemon=True, name=f"notp_poll_{oid}").start()
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -21662,6 +22073,9 @@ def _text_message_worker(message):
     # ── 📬 Gmail & iCloud বাটন → ভিতরে Gmail / iCloud inline বাটন ──
     elif text == GMAIL_ICLOUD_ORDER_KEY:
         _show_gmail_icloud_submenu(user_id, db); return
+    # ── 📱 Number OTP বাটন → সার্ভিস লিস্ট ──
+    elif text == NUMBER_OTP_ORDER_KEY:
+        _show_number_otp_menu(user_id, db); return
     # ── 📨 Hotmail & Outlook বাটন → ভিতরে Hotmail / Outlook inline বাটন ──
     elif text == HOTMAIL_OUTLOOK_ORDER_KEY:
         _show_hotmail_outlook_submenu(user_id, db); return
@@ -21810,6 +22224,7 @@ def _shop_button_only_display_map(db=None):
         EDU_MAIL_PARENT: "📧 Edu Mail",
         GMAIL_PARENT: GMAIL_BTN_LABEL,
         GMAIL_ICLOUD_ORDER_KEY: GMAIL_ICLOUD_BTN_LABEL,
+        NUMBER_OTP_ORDER_KEY: NUMBER_OTP_BTN_LABEL,
         HOTMAIL_OUTLOOK_ORDER_KEY: HOTMAIL_OUTLOOK_BTN_LABEL,
         PRODUCT1_ORDER_KEY: f"🅰️ {get_product1_btn_label(db)}",
         PRODUCT2_ORDER_KEY: f"🅱️ {get_product2_btn_label(db)}",
@@ -21843,7 +22258,7 @@ def _shop_raw_item_keys(db=None):
         products = [GMAIL_PARENT] + products
     if show_edu_mail_btn:
         products = [EDU_MAIL_PARENT] + products  # প্রথমে Edu Mail
-    return products + [GMAIL_ICLOUD_ORDER_KEY, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY]
+    return products + [GMAIL_ICLOUD_ORDER_KEY, NUMBER_OTP_ORDER_KEY, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY]
 
 def _shop_default_item_keys(db=None):
     """বর্তমানে Buy Mail শপ মেনুতে যেই আইটেমগুলো দেখানো হবে, তাদের key —
@@ -21943,6 +22358,8 @@ def _shop_label_to_key(text, db=None):
         return GMAIL_PARENT
     if text == GMAIL_ICLOUD_BTN_LABEL:
         return GMAIL_ICLOUD_ORDER_KEY
+    if text == NUMBER_OTP_BTN_LABEL:
+        return NUMBER_OTP_ORDER_KEY
     if text == HOTMAIL_OUTLOOK_BTN_LABEL:
         return HOTMAIL_OUTLOOK_ORDER_KEY
     return text
@@ -21962,6 +22379,8 @@ def _shop_item_display_label(item_key, db=None):
         return _shop_btn_labels(db).get(item_key) or GMAIL_BTN_LABEL
     if item_key == GMAIL_ICLOUD_ORDER_KEY:
         return _shop_btn_labels(db).get(item_key) or GMAIL_ICLOUD_BTN_LABEL
+    if item_key == NUMBER_OTP_ORDER_KEY:
+        return _shop_btn_labels(db).get(item_key) or NUMBER_OTP_BTN_LABEL
     if item_key == HOTMAIL_OUTLOOK_ORDER_KEY:
         return _shop_btn_labels(db).get(item_key) or HOTMAIL_OUTLOOK_BTN_LABEL
     return _shop_btn_labels(db).get(item_key) or item_key
@@ -26530,7 +26949,7 @@ def _process_deposit_request_inner(message, user_id, method, account, amount, is
                 return
 
     # ══════════════════════════════════════════════════
-    # ?? BINANCE — Manual Admin Approval (আগের মতোই)
+    # 🔵 BINANCE — Manual Admin Approval (আগের মতোই)
     # ══════════════════════════════════════════════════
     request_id = f"DEP-{uuid.uuid4().hex[:6].upper()}"
     current_time = get_now()
@@ -29844,7 +30263,7 @@ def _callback_worker_impl(call):
             bot.answer_callback_query(call.id, "❌ No products!", show_alert=True); return
         _admin_sessions["del_product_list"] = {}
         markup = types.InlineKeyboardMarkup(row_width=1)
-        special_keys = {EDU_MAIL_PARENT, GMAIL_PARENT, GMAIL_ICLOUD_ORDER_KEY, HOTMAIL_OUTLOOK_ORDER_KEY, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY}
+        special_keys = {EDU_MAIL_PARENT, GMAIL_PARENT, GMAIL_ICLOUD_ORDER_KEY, NUMBER_OTP_ORDER_KEY, HOTMAIL_OUTLOOK_ORDER_KEY, PRODUCT1_ORDER_KEY, PRODUCT2_ORDER_KEY, PRODUCT3BULK_ORDER_KEY}
         for idx, key in enumerate(shop_keys):
             label_name = _shop_item_display_label(key, db)
             if key in special_keys:
