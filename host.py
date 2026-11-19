@@ -9637,7 +9637,7 @@ def cb_gmail_icloud(call):
 #     GET  /otp/services/sms/{service}       → দেশ + দাম (price_from) + stock_level / in_stock (live)
 #     POST /otp/buy {kind:sms, service, country} → নম্বর কেনা (সবচেয়ে সস্তা option)
 #     GET  /otp/orders/{id}                  → কোড পোল (আগের Gmail/iCloud এর poll/check/next/cancel/refund ই ব্যবহার হয়)
-#   দাম = API দাম (USD) × ডলার রেট + 💲 Gmail & iCloud Price এ সেট করা Profit %।
+#   দাম = API দাম (USD) × ডলার রেট × (1 + Profit %) + Fixed ৳ — Admin Panel → 💲 Number OTP Profit থেকে সেট হয়।
 #   অর্ডারগুলো "📜 My Mail & OTP History" তেও দেখা যায়।
 # ───────────────────────────────────────────────────────────────────────────
 NOTP_PAGE_SIZE = 25
@@ -9671,7 +9671,7 @@ NOTP_POPULAR = [
     "BR", "MX", "AR", "CO", "CL", "PE", "ZA", "NG", "KE", "EG", "MA", "SA", "AE", "IL", "PK", "BD", "LK", "KZ", "RO", "CZ", "PT", "BE", "AT", "CH",
     "IE", "DK", "NO", "FI", "GR", "HU", "BG", "RS", "HR", "SK", "LT", "LV", "EE", "NZ", "KH", "MM", "NP", "GH", "TZ", "DZ", "TN", "IQ", "JO", "EC", "VE", "UY",
 ]
-_notp_codes = {"t": 0, "map": {}}       # {idx: (service_code, api_name)} — ১ ঘণ্টা cache
+_notp_codes = {"t": 0, "map": {}}       # {idx: (service_code, api_name, cheapest_usd)} — ১০ মিনিট cache
 _notp_lock = threading.Lock()
 _notp_cc_cache = {}                     # {service_code: (ts, {CC: country_dict})} — ৩০ সেকেন্ড (পেজ ঘোরানোর জন্য)
 
@@ -9681,7 +9681,7 @@ def _notp_norm(s):
 
 
 def _notp_find_service(terms, exclude=()):
-    best, best_score = None, 0
+    best, best_score = None, 0          # best = (code, name, price_from_usd)
     for term in terms:
         data, _st = _api_get_json(f"{BULKMAIL_BASE_URL}/otp/services",
                                   params={"kind": "sms", "search": term, "per_page": 100},
@@ -9695,6 +9695,7 @@ def _notp_find_service(terms, exclude=()):
             code, name, _p = _gic_svc_fields(sv)
             if not code or any(x in str(name).lower() for x in exclude):
                 continue
+            _pf = _gic_num(sv.get("price_from"))
             n = _notp_norm(name)
             if n == t:
                 sc = 3
@@ -9705,17 +9706,18 @@ def _notp_find_service(terms, exclude=()):
             else:
                 sc = 0
             if sc > best_score:
-                best, best_score = (str(code), str(name)), sc
+                best, best_score = (str(code), str(name), _pf if _pf is not None else _p), sc
         if best_score == 3:
             break
     return best
 
 
 def _notp_map():
-    """{idx: (code, name)} — প্রতিটা সার্ভিসের API code (সমান্তরালে খুঁজে ১ ঘণ্টা cache)।"""
+    """{idx: (code, name, cheapest_usd)} — প্রতিটা সার্ভিসের API code ও website এর সবচেয়ে কম দাম
+    (সমান্তরালে খুঁজে ১০ মিনিট cache)।"""
     import time as _t
     with _notp_lock:
-        if _notp_codes["map"] and _t.time() - _notp_codes["t"] < 3600:
+        if _notp_codes["map"] and _t.time() - _notp_codes["t"] < 600:
             return _notp_codes["map"]
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=7) as ex:
@@ -9761,18 +9763,19 @@ def _notp_flag(cc):
 
 def _notp_country_usd(ct):
     """দেশের সবচেয়ে কম দাম (USD): price_from, না থাকলে options এর min।"""
-    p = _gic_num(ct.get("price_from"))
-    if p is None:
-        ps = [_gic_num(o.get("price")) for o in (ct.get("options") or []) if isinstance(o, dict)]
-        ps = [x for x in ps if x is not None]
-        p = min(ps) if ps else None
-    return p
+    ps = [_gic_num(ct.get("price_from"))] + [_gic_num(o.get("price")) for o in (ct.get("options") or []) if isinstance(o, dict)]
+    ps = [x for x in ps if x is not None and x > 0]
+    return min(ps) if ps else None
 
 
 def _notp_services_view(uid):
     m = _notp_map()
     markup = types.InlineKeyboardMarkup(row_width=2)
-    btns = [InlineBtn(f"{em} {label}", style="primary", callback_data=f"notp_svc|{i}|1")
+    def _lab(i, label, em):
+        usd = m[i][2] if len(m[i]) > 2 else None
+        pb = _notp_price_bdt(usd, i)
+        return f"{em} {label}" + (f" [{fmt_bdt_precise(pb)}৳]" if pb is not None else "")
+    btns = [InlineBtn(_lab(i, label, em), style="primary", callback_data=f"notp_svc|{i}|1")
             for i, (label, em, _t, _x) in enumerate(NOTP_SERVICES) if i in m]
     for i in range(0, len(btns), 2):
         markup.row(*btns[i:i + 2])
@@ -9788,7 +9791,7 @@ def _notp_countries_view(key, page, uid):
     back.row(InlineBtn("🔙 Back", callback_data="notp_home"))
     try:
         idx = int(key)
-        code, _n = _notp_map()[idx]
+        code = _notp_map()[idx][0]
         label, em = NOTP_SERVICES[idx][0], NOTP_SERVICES[idx][1]
     except Exception:
         return _gic_t(uid, "⚠️ Service not available.", "⚠️ সার্ভিসটি পাওয়া যাচ্ছে না।"), back
@@ -9803,7 +9806,7 @@ def _notp_countries_view(key, page, uid):
     for cc in ordered[(page - 1) * NOTP_PAGE_SIZE: page * NOTP_PAGE_SIZE]:
         ct = cdata[cc]
         usd = _notp_country_usd(ct)
-        pb = _gic_price_bdt(usd) if usd is not None else None
+        pb = _notp_price_bdt(usd, idx)
         name = str(ct.get("country_name") or cc)
         shown = name if len(name) <= 13 else name[:12] + "…"
         ptxt = f" [{fmt_bdt_precise(pb)}৳]" if pb is not None else ""
@@ -9862,7 +9865,7 @@ def cb_number_otp(call):
             _gic_edit_or_send(uid, call, text, markup)
         elif act == "notp_pick":
             idx, cc, page = int(parts[1]), parts[2].upper(), int(parts[3])
-            code, _n = _notp_map()[idx]
+            code = _notp_map()[idx][0]
             label, em = NOTP_SERVICES[idx][0], NOTP_SERVICES[idx][1]
             cdata, err = _notp_country_data(code, fresh=True)
             if cdata is None:
@@ -9871,7 +9874,7 @@ def cb_number_otp(call):
             if not ct or ct.get("in_stock") is False:
                 bot.send_message(uid, T("🚧 Out of stock for this country right now.", "🚧 এই দেশের জন্য এখন স্টক নেই।")); return
             usd = _notp_country_usd(ct)
-            pb = _gic_price_bdt(usd) if usd is not None else None
+            pb = _notp_price_bdt(usd, idx)
             price_txt = f"{fmt_bdt_precise(pb)}৳" if pb is not None else "—"
             stock = _gic_first_num(ct, _GIC_STOCK_KEYS)
             avail_txt = _gic_stock_text(uid, stock, ct.get("stock_level"), True)
@@ -9916,7 +9919,7 @@ def _notp_do_buy(uid, key, chat_id=None):
                                 "⚠️ সার্ভিস এখন বন্ধ আছে (API key সেট নেই)। Admin কে জানান।"))
         return
     try:
-        code, _n = _notp_map()[idx]
+        code = _notp_map()[idx][0]
     except Exception:
         bot.send_message(uid, T("⚠️ Service not available.", "⚠️ সার্ভিসটি পাওয়া যাচ্ছে না।")); return
     label, em = NOTP_SERVICES[idx][0], NOTP_SERVICES[idx][1]
@@ -9926,7 +9929,7 @@ def _notp_do_buy(uid, key, chat_id=None):
     ct = cdata.get(cc)
     if not ct or ct.get("in_stock") is False:
         bot.send_message(uid, T("🚧 Out of stock for this country right now.", "🚧 এই দেশের জন্য এখন স্টক নেই।")); return
-    price_bdt = _gic_price_bdt(_notp_country_usd(ct))
+    price_bdt = _notp_price_bdt(_notp_country_usd(ct), idx)
     if price_bdt is None:
         bot.send_message(uid, T("⚠️ Price not available. Please try again later.", "⚠️ দাম পাওয়া যায়নি। একটু পরে আবার চেষ্টা করুন।")); return
     db = load_db()
@@ -9950,7 +9953,7 @@ def _notp_do_buy(uid, key, chat_id=None):
         logging.error(f"notp buy: no order id in {res}")
         return
     real_usd = _gic_num(od.get("price"))
-    charge = _gic_price_bdt(real_usd) if real_usd is not None else price_bdt       # কেনার মুহূর্তের আসল দাম
+    charge = _notp_price_bdt(real_usd, idx) if real_usd is not None else price_bdt       # কেনার মুহূর্তের আসল দাম
     cname = ct.get("country_name") or cc
     phone = od.get("phone_number") or ""
     entry = {"id": f"GIC{oid}", "gic_id": oid, "product_name": f"📱 Number OTP · {label} ({cname})",
@@ -9975,6 +9978,248 @@ def _notp_do_buy(uid, key, chat_id=None):
     except Exception as e:
         logging.warning(f"notp log channel error: {e}")
     threading.Thread(target=_gic_poll_worker, args=(uid, oid, chat_id), daemon=True, name=f"notp_poll_{oid}").start()
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 💲 NUMBER OTP PROFIT — Admin Panel → 💲 Number OTP Profit
+#   দাম = API দাম (USD) × ডলার রেট × (1 + Profit %) + Fixed ৳
+#   • Global: সব Number OTP সার্ভিসে (📈 Profit % + ➕ Fixed ৳)
+#   • Service-wise: কোনো সার্ভিসে আলাদা profit দিলে সেটাই সেই সার্ভিসে প্রযোজ্য (global এর বদলে)
+#   DB: /settings/notp_pricing = {"pct": %, "fixed": ৳, "svc": {"s<idx>": {"pct": %, "fixed": ৳}}}
+# ───────────────────────────────────────────────────────────────────────────
+def _notp_num(v, default=0.0):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _notp_pricing_cfg():
+    """(global_pct, global_fixed, {"s<idx>": {"pct","fixed"}})"""
+    try:
+        cfg = (load_db().get("settings", {}) or {}).get("notp_pricing")
+    except Exception:
+        cfg = None
+    if not isinstance(cfg, dict):
+        cfg = {}
+    svc = cfg.get("svc")
+    svc = svc if isinstance(svc, dict) else {}
+    return _notp_num(cfg.get("pct")), _notp_num(cfg.get("fixed")), svc
+
+
+def _notp_profit_for(idx, cfg=None):
+    """(pct, fixed, is_service_override) — সার্ভিসের আলাদা profit থাকলে সেটা, না থাকলে global।"""
+    pct, fixed, svc = cfg or _notp_pricing_cfg()
+    ov = svc.get(f"s{idx}") if idx is not None else None
+    if isinstance(ov, dict):
+        return _notp_num(ov.get("pct")), _notp_num(ov.get("fixed")), True
+    return pct, fixed, False
+
+
+def _notp_price_bdt(usd, idx=None):
+    """ইউজারকে যে দামে বিক্রি হবে (BDT)। usd না থাকলে None।"""
+    if usd is None:
+        return None
+    pct, fixed, _ov = _notp_profit_for(idx)
+    return round(float(usd) * float(get_usd_bdt_rate()) * (1 + pct / 100.0) + fixed, 2)
+
+
+def _notp_pricing_save(pct=None, fixed=None, svc=None):
+    cur_pct, cur_fixed, cur_svc = _notp_pricing_cfg()
+    cfg = {"pct": cur_pct if pct is None else pct,
+           "fixed": cur_fixed if fixed is None else fixed,
+           "svc": cur_svc if svc is None else svc}
+    update_db_path("/settings/notp_pricing", cfg, _async=False)
+
+
+def _notp_fmt_profit(pct, fixed):
+    return f"{pct:g}% + {fixed:g}৳"
+
+
+def _notpp_menu_view():
+    pct, fixed, svc = _notp_pricing_cfg()
+    text = ("💲 <b>Number OTP — Profit Settings</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            f"📈 Profit %: <b>{pct:g}%</b>\n"
+            f"➕ Fixed profit: <b>{fixed:g}৳</b>\n"
+            f"✏️ Service-wise আলাদা profit: <b>{len(svc)}</b>টা সার্ভিসে\n\n"
+            "ℹ️ দাম = API দাম (USD) × ডলার রেট × (1 + Profit %) + Fixed ৳\n"
+            "কোনো সার্ভিসে আলাদা profit দিলে সেই সার্ভিসে global এর বদলে সেটাই প্রযোজ্য হবে।")
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.row(InlineBtn("📈 Set Profit %", style="success", callback_data="notpp_pct"),
+          InlineBtn("➕ Set Fixed ৳", style="success", callback_data="notpp_fixed"))
+    m.row(InlineBtn("✏️ Service-wise Profit", style="primary", callback_data="notpp_svcs"))
+    if svc:
+        m.row(InlineBtn("♻️ Reset All Service Profits", style="danger", callback_data="notpp_resetall"))
+    m.row(InlineBtn("🔙 Admin Panel", style="primary", callback_data="back_admin"))
+    return text, m
+
+
+def _notpp_services_view():
+    pct, fixed, svc = _notp_pricing_cfg()
+    m = types.InlineKeyboardMarkup(row_width=2)
+    btns = []
+    for i, (label, em, _t, _x) in enumerate(NOTP_SERVICES):
+        ov = svc.get(f"s{i}")
+        if isinstance(ov, dict):
+            btns.append(InlineBtn(f"✏️ {label} [{_notp_fmt_profit(_notp_num(ov.get('pct')), _notp_num(ov.get('fixed')))}]"[:40],
+                                  style="success", callback_data=f"notpp_sel|{i}"))
+        else:
+            btns.append(InlineBtn(f"{em} {label}", style="primary", callback_data=f"notpp_sel|{i}"))
+    for i in range(0, len(btns), 2):
+        m.row(*btns[i:i + 2])
+    m.row(InlineBtn("🔙 Back", callback_data="notpp_back"))
+    text = ("✏️ <b>Service-wise Profit</b>\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
+            "যে সার্ভিসে আলাদা profit দিতে চান তাতে ট্যাপ করুন। ✏️ = আলাদা profit সেট আছে।\n"
+            f"Global: <b>{_notp_fmt_profit(pct, fixed)}</b>")
+    return text, m
+
+
+def _notpp_cancelled(q):
+    return (not q) or q.startswith("/") or q in ("back", "cancel", "❌ cancel")
+
+
+def _notpp_pct_step(message):
+    uid = str(message.chat.id)
+    if not is_admin(uid):
+        return
+    q = (message.text or "").strip().lower().replace("%", "").replace(",", ".")
+    if _notpp_cancelled(q):
+        return
+    try:
+        v = float(q)
+        if v < 0 or v > 1000:
+            raise ValueError
+    except ValueError:
+        msg = bot.send_message(uid, "❌ ভুল মান। 0 থেকে 1000 এর মধ্যে সংখ্যা লিখুন (যেমন <code>10</code>) অথবা cancel লিখুন:", parse_mode="HTML")
+        bot.register_next_step_handler(msg, _notpp_pct_step)
+        return
+    _notp_pricing_save(pct=v)
+    text, m = _notpp_menu_view()
+    bot.send_message(uid, f"✅ Profit % সেট হয়েছে: <b>{v:g}%</b>\n\n" + text, parse_mode="HTML", reply_markup=m)
+
+
+def _notpp_fixed_step(message):
+    uid = str(message.chat.id)
+    if not is_admin(uid):
+        return
+    q = (message.text or "").strip().lower().replace("৳", "").replace(",", ".").strip()
+    if _notpp_cancelled(q):
+        return
+    try:
+        v = float(q)
+        if v < 0 or v > 100000:
+            raise ValueError
+    except ValueError:
+        msg = bot.send_message(uid, "❌ ভুল মান। টাকার সংখ্যা লিখুন (যেমন <code>2</code>), বন্ধ করতে <code>0</code>, বাতিলে cancel লিখুন:", parse_mode="HTML")
+        bot.register_next_step_handler(msg, _notpp_fixed_step)
+        return
+    _notp_pricing_save(fixed=v)
+    text, m = _notpp_menu_view()
+    bot.send_message(uid, f"✅ Fixed profit সেট হয়েছে: <b>{v:g}৳</b>\n\n" + text, parse_mode="HTML", reply_markup=m)
+
+
+def _notpp_svc_step(message, idx):
+    """সার্ভিসের আলাদা profit — "10%" (শুধু %), "5" (শুধু ৳), "10% 5" (দুটোই), "reset" (global এ ফেরা)।"""
+    uid = str(message.chat.id)
+    if not is_admin(uid):
+        return
+    q = (message.text or "").strip().lower().replace("৳", " ").replace(",", ".")
+    if _notpp_cancelled(q):
+        return
+    label = NOTP_SERVICES[idx][0]
+    pct, fixed, svc = _notp_pricing_cfg()
+    svc = dict(svc)
+    key = f"s{idx}"
+    if q in ("reset", "auto", "off", "global"):
+        svc.pop(key, None)
+        _notp_pricing_save(svc=svc)
+        res = f"♻️ <b>{_gm_e(label)}</b> — আলাদা profit মুছে গেছে। এখন global: <b>{_notp_fmt_profit(pct, fixed)}</b>"
+    else:
+        cur_pct, cur_fixed, _ov = _notp_profit_for(idx)       # যেটা লেখা হয়নি সেটা বর্তমান মান থেকে নেবে
+        new_pct, new_fixed = cur_pct, cur_fixed
+        try:
+            toks = q.split()
+            if not toks or len(toks) > 2:
+                raise ValueError
+            for t in toks:
+                if t.endswith("%"):
+                    new_pct = float(t[:-1])
+                else:
+                    new_fixed = float(t)
+            if new_pct < 0 or new_pct > 1000 or new_fixed < 0 or new_fixed > 100000:
+                raise ValueError
+        except ValueError:
+            msg = bot.send_message(uid, "❌ ভুল মান। <code>10%</code> (শুধু %), <code>5</code> (শুধু ৳), <code>10% 5</code> (দুটোই), "
+                                        "<code>reset</code> (global এ ফেরা) অথবা cancel লিখুন:", parse_mode="HTML")
+            bot.register_next_step_handler(msg, _notpp_svc_step, idx)
+            return
+        svc[key] = {"pct": new_pct, "fixed": new_fixed}
+        _notp_pricing_save(svc=svc)
+        res = (f"✅ <b>{_gm_e(label)}</b> — আলাদা profit: <b>{_notp_fmt_profit(new_pct, new_fixed)}</b>\n"
+               f"উদাহরণ: API $0.05 → <b>{fmt_bdt_precise(_notp_price_bdt(0.05, idx))}৳</b>")
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.row(InlineBtn("🔙 সার্ভিস লিস্ট", callback_data="notpp_svcs"))
+    m.row(InlineBtn("💲 Profit Settings", callback_data="notpp_back"))
+    bot.send_message(uid, res, parse_mode="HTML", reply_markup=m)
+
+
+@bot.callback_query_handler(func=lambda c: (c.data or "").startswith("notpp_"))
+def cb_notp_profit_admin(call):
+    uid = str(call.from_user.id)
+    if not is_admin(uid):
+        try:
+            bot.answer_callback_query(call.id, "❌ Admin access only!", show_alert=True)
+        except Exception:
+            pass
+        return
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    _EXECUTOR.submit(_notp_profit_admin_worker, call, uid)
+
+
+def _notp_profit_admin_worker(call, uid):
+    try:
+        parts = (call.data or "").split("|")
+        act = parts[0]
+        if act == "notpp_menu":                       # Admin Panel থেকে — নতুন মেসেজে
+            text, m = _notpp_menu_view()
+            bot.send_message(uid, text, parse_mode="HTML", reply_markup=m)
+        elif act == "notpp_back":
+            text, m = _notpp_menu_view()
+            _gic_edit_or_send(uid, call, text, m)
+        elif act == "notpp_pct":
+            pct, _f, _s = _notp_pricing_cfg()
+            msg = bot.send_message(uid, f"📈 <b>Profit %</b>\n\nবর্তমান: <b>{pct:g}%</b>\n"
+                                        "নতুন % লিখুন (যেমন <code>10</code>)। এটা সব Number OTP সার্ভিসের API দামের উপর যোগ হবে। "
+                                        "বাতিল করতে cancel লিখুন।", parse_mode="HTML")
+            bot.register_next_step_handler(msg, _notpp_pct_step)
+        elif act == "notpp_fixed":
+            _p, fixed, _s = _notp_pricing_cfg()
+            msg = bot.send_message(uid, f"➕ <b>Fixed profit (৳)</b>\n\nবর্তমান: <b>{fixed:g}৳</b>\n"
+                                        "প্রতিটা নম্বরের দামের উপর যত টাকা যোগ হবে লিখুন (যেমন <code>2</code>)। বন্ধ করতে <code>0</code>। "
+                                        "বাতিল করতে cancel লিখুন।", parse_mode="HTML")
+            bot.register_next_step_handler(msg, _notpp_fixed_step)
+        elif act == "notpp_svcs":
+            text, m = _notpp_services_view()
+            _gic_edit_or_send(uid, call, text, m)
+        elif act == "notpp_sel":
+            idx = int(parts[1])
+            pct, fixed, is_ov = _notp_profit_for(idx)
+            msg = bot.send_message(uid,
+                f"💲 <b>{_gm_e(NOTP_SERVICES[idx][0])} — Profit</b>\n\n"
+                f"বর্তমান: <b>{_notp_fmt_profit(pct, fixed)}</b> ({'আলাদা সেট করা' if is_ov else 'global'})\n\n"
+                "লিখুন:\n• <code>10%</code> → শুধু Profit % বদলাবে\n• <code>5</code> → শুধু Fixed ৳ বদলাবে\n"
+                "• <code>10% 5</code> → দুটোই\n• <code>reset</code> → আলাদা profit মুছে global এ ফেরা\n"
+                "(যেটা লিখবেন না সেটা বর্তমান মানই থাকবে) — বাতিলে cancel লিখুন।", parse_mode="HTML")
+            bot.register_next_step_handler(msg, _notpp_svc_step, idx)
+        elif act == "notpp_resetall":
+            _notp_pricing_save(svc={})
+            text, m = _notpp_menu_view()
+            _gic_edit_or_send(uid, call, "♻️ সব service-wise profit মুছে গেছে।\n\n" + text, m)
+    except Exception as e:
+        logging.error(f"notp profit admin error ({call.data}): {e}\n{traceback.format_exc()}")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -12741,7 +12986,7 @@ LANG = {
         "deposit": "💰 ডিপোজিট",
         "balance": "👤 আমার প্রোফাইল",
         "orders": "📜 আমার অর্ডার",
-        "refer": "👥 রেফার করুন",
+        "refer": "?? রেফার করুন",
         "other": "↪️ More Option",
         "other_menu_title": "↪️ <b>অন্যান্য অপশন</b>\n\n<i>নিচের অপশন বেছে নিন 👇</i>",
         "support": "☎️ সাপোর্ট",
@@ -14077,7 +14322,7 @@ def _proxy_delivery_msg(host, port, user, pw):
         "━━━━━━━━━━━━━━━━━━━\n"
         f"🌐 𝐇𝐨𝐬𝐭 : <code>{_hx(host)}</code>\n"
         f"🔌 𝐏𝐨𝐫𝐭 : <code>{_hx(port)}</code>\n"
-        f"👤 𝐔𝐬𝐞𝐫 : <code>{_hx(user)}</code>\n"
+        f"👤 𝐔𝐬??𝐫 : <code>{_hx(user)}</code>\n"
         f"🔐 𝐏𝐚𝐬𝐬 : <code>{_hx(pw)}</code>\n"
         f"👨‍💻 Full: <code>{_hx(host)}:{_hx(port)}:{_hx(user)}:{_hx(pw)}</code>\n\n"
         "✅ 𝐒𝐚𝐯𝐞 𝐭𝐡𝐞𝐬𝐞 𝐝𝐞𝐭𝐚𝐢𝐥𝐬 𝐬𝐞𝐜𝐮𝐫𝐞𝐥𝐲."
@@ -27792,6 +28037,9 @@ def show_admin_panel(user_id):
     )
     markup.add(
         InlineBtn("💲 Gmail & iCloud Price", style="primary", callback_data="gicp_menu")
+    )
+    markup.add(
+        InlineBtn("💲 Number OTP Profit", style="primary", callback_data="notpp_menu")
     )
     markup.add(
         InlineBtn("🛡️ All VPN Management", style="success", callback_data="admin_vpn_manage")
